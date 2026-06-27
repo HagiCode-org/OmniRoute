@@ -154,7 +154,10 @@ export async function createConnectionFromAuthFile(
   parsed: ParsedCodexAuth,
   options: CreateConnectionOptions
 ): Promise<{ connection: JsonRecord; created: boolean }> {
-  const existing = await findExistingCodexConnection(parsed.accountId);
+  const existing = await findExistingCodexConnection(
+    parsed.accountId,
+    options.email || parsed.email
+  );
 
   if (existing) {
     if (!options.overwriteExisting) {
@@ -229,12 +232,27 @@ export async function createConnectionFromAuthFile(
   return { connection, created: true };
 }
 
-async function findExistingCodexConnection(accountId: string): Promise<JsonRecord | null> {
+async function findExistingCodexConnection(
+  accountId: string,
+  email?: string | null
+): Promise<JsonRecord | null> {
   const connections = await getProviderConnections({ provider: "codex" });
+  const normalizedEmail = toNonEmptyString(email);
+
+  const workspaceMatches = connections.filter((c) => {
+    const psd = toRecord((c as JsonRecord).providerSpecificData);
+    return toNonEmptyString(psd.workspaceId) === accountId;
+  }) as JsonRecord[];
+
+  if (!normalizedEmail) {
+    return workspaceMatches[0] ?? null;
+  }
+
   return (
-    (connections.find((c) => {
-      const psd = toRecord((c as JsonRecord).providerSpecificData);
-      return toNonEmptyString(psd.workspaceId) === accountId;
-    }) as JsonRecord | undefined) ?? null
+    workspaceMatches.find(
+      (connection) => toNonEmptyString((connection as JsonRecord).email) === normalizedEmail
+    ) ??
+    workspaceMatches.find((connection) => !toNonEmptyString((connection as JsonRecord).email)) ??
+    null
   );
 }

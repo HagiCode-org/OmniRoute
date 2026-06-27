@@ -124,6 +124,10 @@ const IGNORE_FROM_CODE = new Set([
   "QA_LOCALES",
   "QA_REPORT_SUFFIX",
   "QA_ROUTES",
+  // Dev/import script helpers — script-only config, not runtime.
+  "OMNIROUTE_AUTH_COOKIE",
+  "OMNIROUTE_INSTANCE_URL",
+  "OMNIROUTE_PASSWORD",
   // Doctor diagnostic flags (no runtime behavior yet — placeholders).
   "OMNIROUTE_DOCTOR_HOST",
   "OMNIROUTE_DOCTOR_LIVENESS_URL",
