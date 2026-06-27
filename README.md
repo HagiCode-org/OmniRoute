@@ -626,6 +626,73 @@ cp .env.example .env && npm install
 PORT=20128 npm run dev
 ```
 
+**🧰 From source with PM2 (repo-local production mode)**
+
+```bash
+nvm install
+nvm use
+npm install -g pm2
+npm install
+cp .env.example .env
+npm run pm2:omniroute:start
+npm run pm2:omniroute:status
+```
+
+Defaults in this mode:
+
+- app name: `omniroute-service`
+- default port: `36129`
+- local data dir: `./data`
+- local logs dir: `./logs`
+- local runtime dir: `./runtime`
+
+To migrate an existing runner, copy its runtime data into this repository before starting:
+
+```bash
+cp /old/runner/env/omniroute.env .env
+rsync -a /old/runner/data/ ./data/
+```
+
+For a running SQLite database, take an online backup instead of copying `storage.sqlite`
+directly:
+
+```bash
+sqlite3 /old/runner/data/storage.sqlite ".backup './data/storage.sqlite'"
+```
+
+Useful commands:
+
+```bash
+npm run pm2:omniroute:restart
+npm run pm2:omniroute:logs
+npm run pm2:omniroute:save
+npm run pm2:omniroute:print-startup-unit
+npm run pm2:omniroute:install-startup
+```
+
+`install-startup` installs a systemd unit named `pm2-$(whoami)` by default and uses the
+current PM2 binary. Override it when needed:
+
+```bash
+OMNIROUTE_PM2_BIN=/your/pm2/path bash scripts/pm2/install-systemd.sh --install
+OMNIROUTE_SYSTEMD_SERVICE_NAME=pm2-omniroute bash scripts/pm2/install-systemd.sh --install
+```
+
+After startup is installed, verify the service and health endpoint:
+
+```bash
+pm2 describe omniroute-service
+systemctl status pm2-$(whoami) --no-pager
+curl http://127.0.0.1:36129/api/monitoring/health
+```
+
+Optional `.env` overrides for this workflow:
+
+```dotenv
+PORT=36129
+DATA_DIR=/absolute/path/to/data
+```
+
 **📦 pnpm**
 
 ```bash
