@@ -1,0 +1,25 @@
+action_recommendations:
+  - id: ci
+    watch: true
+    include: true
+    reason: "build and validate the main app"
+  - id: build-fork
+    watch: true
+    include: true
+    reason: "publish fork image to GHCR"
+  - id: docker-publish
+    watch: true
+    include: true
+    reason: "publish Docker image"
+  - id: npm-publish
+    watch: true
+    include: true
+    reason: "publish npm package"
+  - id: electron-release
+    watch: true
+    include: true
+    reason: "build desktop release artifacts"
+  - id: deploy-vps
+    watch: true
+    include: true
+    reason: "deploy service to VPS"
