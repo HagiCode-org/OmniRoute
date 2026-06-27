@@ -86,6 +86,7 @@ next-env.d.ts
 # data and logs
 data/
 .data/
+runtime/
 logs/*
 test_output.log
 
