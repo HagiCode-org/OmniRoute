@@ -426,6 +426,58 @@ describe("toolSchemaSanitizer", () => {
     });
   });
 
+  describe("auto-generated tool names", () => {
+    it("synthesizes a unique name for Chat-format function tools with empty name", () => {
+      const out = sanitizeOpenAITool({
+        type: "function",
+        function: { parameters: { type: "object", properties: { city: { type: "string" } } } },
+      });
+      assert.match(out.function.name, /^omniroute_tool_/);
+    });
+
+    it("synthesizes a name for flat Responses-format function tools without a name", () => {
+      const out = sanitizeOpenAITool({
+        type: "function",
+        parameters: { type: "object", properties: { city: { type: "string" } } },
+      });
+      assert.match(out.name, /^omniroute_tool_/);
+      assert.deepEqual(out.parameters.properties.city, { type: "string" });
+    });
+
+    it("infers a deterministic name from type for schema-bearing client tools", () => {
+      const out = sanitizeOpenAITool({
+        type: "tool_search",
+        execution: "client",
+        parameters: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"],
+        },
+      });
+      assert.equal(out.name, "tool_search");
+      assert.deepEqual(out.parameters.required, ["query"]);
+    });
+
+    it("preserves an existing non-empty name", () => {
+      const out = sanitizeOpenAITool({
+        type: "function",
+        name: "read_file",
+        parameters: { type: "object" },
+      });
+      assert.equal(out.name, "read_file");
+    });
+
+    it("normalizes input_schema on Anthropic-style tools after naming", () => {
+      const out = sanitizeOpenAITool({ name: "", input_schema: { type: "object" } });
+      assert.match(out.name, /^omniroute_tool_/);
+      assert.deepEqual(out.input_schema, {
+        type: "object",
+        properties: {},
+        additionalProperties: true,
+      });
+    });
+  });
+
   describe("sanitizeOpenAITools", () => {
     it("maps over an array", () => {
       const tools = [

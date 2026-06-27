@@ -46,6 +46,11 @@ export function sanitizeChatRequestBody(
   }
 
   if (Array.isArray(body.tools)) {
+    // Sanitize first so function-like tools with missing names get a synthetic
+    // name before the generic validity filter runs (otherwise schema-bearing
+    // tools with empty names would be dropped instead of named).
+    body.tools = body.tools.map((tool) => sanitizeOpenAITool(tool) as (typeof body.tools)[number]);
+
     body.tools = body.tools.filter((tool: Record<string, unknown>) => {
       const toolType = typeof tool.type === "string" ? tool.type : "";
       if (toolType && toolType !== "function" && !tool.function && tool.name === undefined) {
@@ -55,8 +60,6 @@ export function sanitizeChatRequestBody(
       const name = fn?.name ?? tool.name;
       return name && String(name).trim().length > 0;
     });
-
-    body.tools = body.tools.map((tool) => sanitizeOpenAITool(tool) as (typeof body.tools)[number]);
   }
 
   return body;

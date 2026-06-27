@@ -14,9 +14,18 @@
  * is defensive hygiene: ensures `parameters` is always a valid object schema,
  * filters `required[]` to keys that exist in `properties`, and normalizes a
  * few other shapes that strict validators tend to reject.
+ *
+ * It also auto-generates a valid name for tools that carry a schema but no
+ * name (e.g. `{ type: "function", parameters: {...} }` or Anthropic-style
+ * `{ name: "", input_schema: {...} }`). Upstream providers 400 on empty/missing
+ * tool names, so a synthetic name keeps schema-bearing tools alive instead of
+ * forcing chatCore to drop them.
  */
 
+import { randomUUID } from "node:crypto";
+
 const MAX_RECURSION_DEPTH = 32;
+const SYNTHETIC_TOOL_NAME_PREFIX = "omniroute_tool";
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === "object" && !Array.isArray(v);
@@ -118,6 +127,34 @@ function normalizeParameters(parameters: unknown): unknown {
   return { type: "object", properties: {}, additionalProperties: true };
 }
 
+function hasNonEmptyToolName(name: unknown): name is string {
+  return typeof name === "string" && name.trim().length > 0;
+}
+
+function inferToolNameFromType(type: unknown): string {
+  if (typeof type !== "string") return "";
+  if (type.trim().toLowerCase() === "function") return "";
+  const normalized = type
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (!normalized) return "";
+  return /^[a-z_]/.test(normalized) ? normalized : `${SYNTHETIC_TOOL_NAME_PREFIX}_${normalized}`;
+}
+
+function buildSyntheticToolName(): string {
+  return `${SYNTHETIC_TOOL_NAME_PREFIX}_${randomUUID().replace(/-/g, "_").slice(0, 24)}`;
+}
+
+function resolveFallbackToolName(tool: Record<string, unknown>): string {
+  return inferToolNameFromType(tool.type) || buildSyntheticToolName();
+}
+
+function isSchemaBearingTool(tool: Record<string, unknown>): boolean {
+  return "parameters" in tool || "input_schema" in tool || "execution" in tool;
+}
+
 export function sanitizeOpenAITool(tool: unknown): unknown {
   if (!isPlainObject(tool)) return tool;
   const t = { ...tool };
@@ -125,13 +162,33 @@ export function sanitizeOpenAITool(tool: unknown): unknown {
   if (isPlainObject(t.function)) {
     // Chat Completions format: { type: "function", function: { name, parameters } }
     const f = { ...t.function };
+    if (!hasNonEmptyToolName(f.name)) {
+      f.name = buildSyntheticToolName();
+    }
     f.parameters = normalizeParameters(f.parameters);
     t.function = f;
   } else if (t.type === "function") {
     // Responses API format: { type: "function", name, parameters } — no `function`
     // wrapper. /v1/responses requests reach chatCore in this shape and are only
     // unwrapped later by the request translator, so we have to sanitize here too.
+    if (!hasNonEmptyToolName(t.name)) {
+      t.name = resolveFallbackToolName(t);
+    }
     t.parameters = normalizeParameters(t.parameters);
+  } else if ("input_schema" in t || "name" in t || isSchemaBearingTool(t)) {
+    // Claude-style passthrough tools still require a name once they are bridged
+    // into OpenAI-compatible function tools. Also covers client tools like
+    // { type: "tool_search", execution: "client", parameters: {...} } that
+    // some agents send for Responses-compatible flows.
+    if (!hasNonEmptyToolName(t.name)) {
+      t.name = resolveFallbackToolName(t);
+    }
+    if ("parameters" in t) {
+      t.parameters = normalizeParameters(t.parameters);
+    }
+    if ("input_schema" in t) {
+      t.input_schema = normalizeParameters(t.input_schema);
+    }
   }
 
   return t;

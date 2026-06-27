@@ -98,6 +98,9 @@ export function openaiResponsesToOpenAIRequest(
     for (const toolValue of tools) {
       const tool = toRecord(toolValue);
       const toolType = toString(tool.type);
+      const hasSchemaBearingName =
+        toString(tool.name).trim().length > 0 &&
+        (tool.parameters !== undefined || tool.input_schema !== undefined || tool.execution);
       // Allow: function tools, tools already in Chat format (have .function property), CLI subagent tools,
       // namespace tools (MCP tool groups used by Codex/OpenAI Responses API), and web_search server tools
       // (Anthropic versioned: web_search_20250305, web_search_20250101, etc. — or plain web_search).
@@ -110,6 +113,7 @@ export function openaiResponsesToOpenAIRequest(
         toolType !== "command" &&
         toolType !== "namespace" &&
         toolType !== "local_shell" &&
+        !hasSchemaBearingName &&
         !WEB_SEARCH_TOOL_TYPES.test(toolType) &&
         !TOOL_SEARCH_TOOL_TYPES.test(toolType) &&
         !IMAGE_GENERATION_TOOL_TYPES.test(toolType) &&
@@ -479,7 +483,7 @@ export function openaiResponsesToOpenAIRequest(
           function: {
             name,
             description: toString(tool.description),
-            parameters: tool.parameters,
+            parameters: tool.parameters ?? tool.input_schema,
             strict: tool.strict,
           },
         };
@@ -801,18 +805,23 @@ export function openaiToOpenAIResponsesRequest(
   if (Array.isArray(root.tools)) {
     result.tools = root.tools.map((toolValue) => {
       const tool = toRecord(toolValue);
-      if (tool.type === "function") {
+      const shouldFlattenToFunction =
+        tool.type === "function" ||
+        !!tool.function ||
+        (toString(tool.name).trim().length > 0 &&
+          (tool.parameters !== undefined || tool.input_schema !== undefined || tool.execution));
+      if (shouldFlattenToFunction) {
         const fn = toRecord(tool.function);
-        const name = toString(fn.name);
+        const name = toString(fn.name || tool.name);
         if (name === "shell") {
           return { type: "local_shell" };
         }
         return {
           type: "function",
           name,
-          description: toString(fn.description),
-          parameters: fn.parameters,
-          strict: fn.strict,
+          description: toString(fn.description || tool.description),
+          parameters: fn.parameters ?? tool.parameters ?? fn.input_schema ?? tool.input_schema,
+          strict: fn.strict ?? tool.strict,
         };
       }
       return toolValue;

@@ -229,7 +229,11 @@ test("Responses -> Chat strips safety_identifier (LobeHub #2770)", () => {
     null
   ) as Record<string, unknown>;
 
-  assert.equal(result.safety_identifier, undefined, "safety_identifier must be stripped before forwarding to Chat Completions");
+  assert.equal(
+    result.safety_identifier,
+    undefined,
+    "safety_identifier must be stripped before forwarding to Chat Completions"
+  );
   assert.ok(Array.isArray(result.messages), "translation must still produce messages");
 });
 
@@ -247,7 +251,11 @@ test("Responses -> Chat strips client_metadata (Mistral 422 fix)", () => {
     null
   ) as Record<string, unknown>;
 
-  assert.equal(result.client_metadata, undefined, "client_metadata must be stripped before forwarding to Chat Completions");
+  assert.equal(
+    result.client_metadata,
+    undefined,
+    "client_metadata must be stripped before forwarding to Chat Completions"
+  );
   assert.ok(Array.isArray(result.messages), "translation must still produce messages");
   assert.equal((result.messages as unknown[]).length, 1, "user message must be preserved");
 });
@@ -383,6 +391,97 @@ test("Chat -> Responses converts messages, tool calls, tool outputs, tools and p
   assert.equal((result as any).temperature, 0.2);
   assert.equal((result as any).max_output_tokens, 100);
   assert.equal((result as any).top_p, 0.9);
+});
+
+test("Responses -> Chat allows schema-bearing client tools past the type validator", () => {
+  // A tool with a non-built-in type but a real name + parameters should not be
+  // rejected as an unsupported feature; it converts to a named function below.
+  const result = openaiResponsesToOpenAIRequest(
+    "gpt-4.1",
+    {
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "Hello" }] }],
+      tools: [
+        {
+          type: "tool_search",
+          execution: "client",
+          name: "tool_search",
+          parameters: {
+            type: "object",
+            properties: { query: { type: "string" } },
+            required: ["query"],
+          },
+        },
+      ],
+    },
+    false,
+    null
+  );
+  // tool_search is dropped by the converter (Responses built-in), so the
+  // important assertion here is that validation did not throw.
+  assert.equal(Array.isArray((result as any).tools), true);
+});
+
+test("Chat -> Responses flattens schema-bearing client tools into named function tools", () => {
+  const result = openaiToOpenAIResponsesRequest(
+    "gpt-4.1",
+    {
+      messages: [{ role: "user", content: "Hello" }],
+      tools: [
+        {
+          type: "tool_search",
+          execution: "client",
+          name: "tool_search",
+          parameters: {
+            type: "object",
+            properties: { query: { type: "string" } },
+            required: ["query"],
+          },
+        },
+      ],
+    },
+    false,
+    null
+  );
+
+  const tools = (result as any).tools;
+  assert.equal(Array.isArray(tools), true);
+  assert.deepEqual(tools, [
+    {
+      type: "function",
+      name: "tool_search",
+      description: "",
+      parameters: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        required: ["query"],
+      },
+      strict: undefined,
+    },
+  ]);
+});
+
+test("Chat -> Responses falls back to input_schema when parameters is absent", () => {
+  const result = openaiToOpenAIResponsesRequest(
+    "gpt-4.1",
+    {
+      messages: [{ role: "user", content: "Hello" }],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "anthropic_tool",
+            input_schema: { type: "object", properties: { q: { type: "string" } } },
+          },
+        },
+      ],
+    },
+    false,
+    null
+  );
+
+  const tool = (result as any).tools[0];
+  assert.equal(tool.name, "anthropic_tool");
+  assert.deepEqual(tool.parameters, { type: "object", properties: { q: { type: "string" } } });
 });
 
 test("Responses round-trip preserves store and previous_response_id when opt-in is enabled", () => {
@@ -1038,9 +1137,7 @@ test("Responses -> Chat: a valid function_call/output pair is preserved (issue #
   ) as Record<string, unknown>;
 
   const messages = result.messages as any[];
-  const assistant = messages.find(
-    (m) => m.role === "assistant" && Array.isArray(m.tool_calls)
-  );
+  const assistant = messages.find((m) => m.role === "assistant" && Array.isArray(m.tool_calls));
   assert.ok(assistant, "assistant message with tool_calls must be present");
   assert.equal(assistant.tool_calls[0].id, "c1");
   const toolMsg = messages.find((m) => m.role === "tool");
