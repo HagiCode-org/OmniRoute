@@ -76,6 +76,11 @@ const TRANSIENT_DB_CLOSED_RE = /database\s*(connection\s*)?(is\s*)?closed/i;
 export async function ensureDbReadyForBoot(
   ensureDbInitializedFn?: () => Promise<void>
 ): Promise<void> {
+  if (process.env.OMNIROUTE_SKIP_BOOT_DB_INIT === "1") {
+    console.warn("[STARTUP] Skipping boot DB initialization (OMNIROUTE_SKIP_BOOT_DB_INIT=1)");
+    return;
+  }
+
   const ensureDbInitialized =
     ensureDbInitializedFn ?? (await import("@/lib/db/core")).ensureDbInitialized;
 

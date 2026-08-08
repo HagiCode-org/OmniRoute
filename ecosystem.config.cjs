@@ -99,6 +99,7 @@ module.exports = {
       error_file: path.join(logsDir, "omniroute-error.log"),
       env: {
         NODE_ENV: "production",
+        OMNIROUTE_PM2_USE_DEV: "0",
         ...(nodeVersion ? { OMNIROUTE_NODE_VERSION: nodeVersion } : {}),
         HOST: host,
         PORT: String(port),
