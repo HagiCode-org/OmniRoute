@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import fs from "node:fs/promises";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -26,6 +26,53 @@ import {
 const projectRoot = process.cwd();
 const distDir = path.resolve(process.env.NEXT_DIST_DIR || ".build/next");
 const backupRoot = path.join(os.tmpdir(), `omniroute-build-isolated-${process.pid}-${Date.now()}`);
+
+function readDotEnvBuildDefaults(rootDir = projectRoot) {
+  const envPath = path.join(rootDir, ".env");
+  if (!existsSync(envPath)) return {};
+
+  const values = {};
+  try {
+    const raw = readFileSync(envPath, "utf8");
+    for (const rawLine of raw.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const separatorIndex = line.indexOf("=");
+      if (separatorIndex <= 0) continue;
+
+      const key = line.slice(0, separatorIndex).trim();
+      let value = line.slice(separatorIndex + 1).trim();
+      if (
+        value.length >= 2 &&
+        ((value.startsWith('"') && value.endsWith('"')) ||
+          (value.startsWith("'") && value.endsWith("'")))
+      ) {
+        value = value.slice(1, -1);
+      }
+      values[key] = value;
+    }
+  } catch {
+    // Ignore .env parse issues; callers keep existing env defaults.
+  }
+  return values;
+}
+
+function resolveBuildDefaults(baseEnv = process.env) {
+  const env = { ...baseEnv };
+  const dotEnv = readDotEnvBuildDefaults();
+
+  if (env.OMNIROUTE_USE_TURBOPACK === undefined && dotEnv.OMNIROUTE_USE_TURBOPACK !== undefined) {
+    env.OMNIROUTE_USE_TURBOPACK = dotEnv.OMNIROUTE_USE_TURBOPACK;
+  }
+  if (
+    env.OMNIROUTE_BUILD_MEMORY_MB === undefined &&
+    dotEnv.OMNIROUTE_BUILD_MEMORY_MB !== undefined
+  ) {
+    env.OMNIROUTE_BUILD_MEMORY_MB = dotEnv.OMNIROUTE_BUILD_MEMORY_MB;
+  }
+
+  return env;
+}
 
 export function getTransientBuildPaths(rootDir = projectRoot, env = process.env) {
   const paths = [
@@ -122,12 +169,13 @@ function runNextBuild() {
 }
 
 export function resolveNextBuildBundlerFlag(baseEnv = process.env) {
+  const env = resolveBuildDefaults(baseEnv);
   // Turbopack is the default production bundler (Next 16 stable). Benchmarked on
   // this codebase: 2-3x faster than the single-threaded webpack pass (17min -> 9min
   // on a 32-core box; ~20min -> 7min on ubuntu-latest), artifact validated
   // end-to-end (standalone smoke + e2e/package/electron CI jobs). Webpack stays as
   // the explicit escape hatch (=0) for bundler-compat regressions.
-  return baseEnv.OMNIROUTE_USE_TURBOPACK === "0" ? "--webpack" : "--turbopack";
+  return env.OMNIROUTE_USE_TURBOPACK === "0" ? "--webpack" : "--turbopack";
 }
 
 /**
@@ -142,9 +190,10 @@ export function getWindowsBuildProfileDir() {
 }
 
 export function resolveNextBuildEnv(baseEnv = process.env, platform = process.platform) {
+  const mergedEnv = resolveBuildDefaults(baseEnv);
   const env = {
-    ...baseEnv,
-    NEXT_PRIVATE_BUILD_WORKER: baseEnv.NEXT_PRIVATE_BUILD_WORKER || "0",
+    ...mergedEnv,
+    NEXT_PRIVATE_BUILD_WORKER: mergedEnv.NEXT_PRIVATE_BUILD_WORKER || "0",
   };
 
   // Windows-only: `next build`'s static-generation glob scan and framework cache
@@ -161,7 +210,7 @@ export function resolveNextBuildEnv(baseEnv = process.env, platform = process.pl
   // above) to avoid double-isolating nested build invocations.
   // Port of decolua/9router#2402 ("fix(build): isolate Windows HOME/AppData
   // during next build").
-  if (platform === "win32" && !baseEnv.NEXT_DIST_DIR) {
+  if (platform === "win32" && !mergedEnv.NEXT_DIST_DIR) {
     const buildHomeDir = getWindowsBuildProfileDir();
     env.HOME = buildHomeDir;
     env.USERPROFILE = buildHomeDir;
@@ -186,7 +235,7 @@ export function resolveNextBuildEnv(baseEnv = process.env, platform = process.pl
     // headroom without risk. NOTE: heap size does NOT fix a poisoned scope — if the build
     // OOMs/livelocks far above this, check for worktrees/cruft leaking into the tsconfig
     // scope (run `npm run check:build-scope`), not for "more heap". See incident 2026-06-25.
-    const heapMb = Number(baseEnv.OMNIROUTE_BUILD_MEMORY_MB) || 8192;
+    const heapMb = Number(mergedEnv.OMNIROUTE_BUILD_MEMORY_MB) || 8192;
     env.NODE_OPTIONS = `${env.NODE_OPTIONS || ""} --max-old-space-size=${heapMb}`.trim();
   }
 
