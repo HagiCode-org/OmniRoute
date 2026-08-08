@@ -1,4 +1,3 @@
-import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 import { createBetterSqliteAdapter } from "./betterSqliteAdapter";
 import { createBunSqliteAdapter, type BunSqliteDatabaseLike } from "./bunSqliteAdapter";
@@ -8,7 +7,14 @@ import {
 } from "./nodeSqliteShared";
 import type { SqliteAdapter } from "./types";
 
-const _require = createRequire(import.meta.url);
+declare const __non_webpack_require__: ((moduleName: string) => unknown) | undefined;
+
+function loadDriverModule(moduleName: string): unknown {
+  if (typeof __non_webpack_require__ === "function") {
+    return __non_webpack_require__(moduleName);
+  }
+  throw new Error("Native require is unavailable in current runtime");
+}
 
 type DriverLoader = (moduleName: string) => unknown;
 
@@ -152,7 +158,7 @@ export function createSyncDriverFactory(load: DriverLoader) {
 }
 
 /** Tenta abrir com better-sqlite3 e node:sqlite sincronamente. Retorna null se ambos falharem. */
-export const tryOpenSync = createSyncDriverFactory(_require);
+export const tryOpenSync = createSyncDriverFactory(loadDriverModule);
 
 /**
  * Pré-inicializa sql.js para um filePath.
