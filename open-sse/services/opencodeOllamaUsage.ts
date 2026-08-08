@@ -13,8 +13,13 @@ type UsageQuota = {
   currency?: string;
 };
 
-const OPENCODE_GO_QUOTA_URL =
-  process.env.OMNIROUTE_OPENCODE_GO_QUOTA_URL ?? "https://api.z.ai/api/monitor/usage/quota/limit";
+// OpenCode Go does not expose a public quota API. There is no working
+// opencode.ai endpoint to default to (see #7022) — the quota-by-API-key path
+// below is opt-in only and activates exclusively when the operator sets
+// OMNIROUTE_OPENCODE_GO_QUOTA_URL explicitly. Never hardcode a third-party
+// host here (a previous default silently sent the user's API key to an
+// unrelated Z.AI endpoint).
+const OPENCODE_GO_QUOTA_URL = process.env.OMNIROUTE_OPENCODE_GO_QUOTA_URL?.trim() || "";
 const OPENCODE_GO_DASHBOARD_BASE_URL =
   process.env.OMNIROUTE_OPENCODE_GO_DASHBOARD_URL ?? "https://opencode.ai/workspace";
 const OPENCODE_GO_QUOTA_TOTALS = { session: 12, weekly: 30, mcp_monthly: 60 } as const;
@@ -283,7 +288,7 @@ async function fetchOpenCodeGoDashboardUsage(
     headers: {
       Accept: "text/html",
       Cookie: `auth=${normalizeOpenCodeGoAuthCookie(config.authCookie)}`,
-      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Gecko/20100101 Firefox/148.0",
+      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Gecko/20100101 Firefox/152.0",
     },
     signal: AbortSignal.timeout(10_000),
   });
@@ -335,6 +340,15 @@ export async function getOpenCodeGoUsage(apiKey: string, providerSpecificData?: 
     };
   }
 
+  if (!OPENCODE_GO_QUOTA_URL) {
+    return {
+      message:
+        "OpenCode Go does not expose a public quota API. " +
+        "Set OPENCODE_GO_WORKSPACE_ID and OPENCODE_GO_AUTH_COOKIE to enable dashboard quota scraping, " +
+        "or set OMNIROUTE_OPENCODE_GO_QUOTA_URL to opt in to an explicit quota endpoint.",
+    };
+  }
+
   try {
     const res = await fetch(OPENCODE_GO_QUOTA_URL, {
       headers: {
@@ -348,7 +362,8 @@ export async function getOpenCodeGoUsage(apiKey: string, providerSpecificData?: 
       if (res.status === 401 || res.status === 403) {
         return {
           message:
-            "OpenCode Go API key is valid for chat/models but cannot read quota from the Z.AI quota API. " +
+            "OpenCode Go API key is valid for chat/models but cannot read quota from the configured " +
+            "OMNIROUTE_OPENCODE_GO_QUOTA_URL endpoint. " +
             "Set OPENCODE_GO_WORKSPACE_ID and OPENCODE_GO_AUTH_COOKIE to enable dashboard quota scraping.",
         };
       }
@@ -374,7 +389,8 @@ export async function getOpenCodeGoUsage(apiKey: string, providerSpecificData?: 
     ) {
       return {
         message:
-          "OpenCode Go API key is valid for chat/models but cannot read quota from the Z.AI quota API. " +
+          "OpenCode Go API key is valid for chat/models but cannot read quota from the configured " +
+          "OMNIROUTE_OPENCODE_GO_QUOTA_URL endpoint. " +
           "Set OPENCODE_GO_WORKSPACE_ID and OPENCODE_GO_AUTH_COOKIE to enable dashboard quota scraping.",
       };
     }
@@ -508,7 +524,7 @@ async function fetchOllamaCloudUsageFromSettings(
     headers: {
       Accept: "text/html",
       Cookie: `${OLLAMA_CLOUD_SESSION_COOKIE}=${normalizeOllamaCloudCookie(config.cookie)}`,
-      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Gecko/20100101 Firefox/148.0",
+      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Gecko/20100101 Firefox/152.0",
     },
     signal: AbortSignal.timeout(10_000),
   });

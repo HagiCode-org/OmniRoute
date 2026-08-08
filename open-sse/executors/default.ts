@@ -1,12 +1,8 @@
-import { BaseExecutor, setUserAgentHeader, type ExecuteInput } from "./base.ts";
+import { BaseExecutor, type ExecuteInput } from "./base.ts";
+import { mapNvidiaGlm52ReasoningParams } from "./base/reasoningEffort.ts";
 import { PROVIDERS, OAUTH_ENDPOINTS } from "../config/constants.ts";
 import { getAccessToken } from "../services/tokenRefresh.ts";
-import {
-  getRotatingApiKey,
-  getValidApiKey,
-  resolveKeyForRequest,
-} from "../services/apiKeyRotator.ts";
-import type { KeyHealth } from "../services/apiKeyRotator.ts";
+
 import {
   buildClaudeCodeCompatibleHeaders,
   CLAUDE_CODE_COMPATIBLE_DEFAULT_CHAT_PATH,
@@ -14,6 +10,7 @@ import {
 } from "../services/claudeCodeCompatible.ts";
 import { getGigachatAccessToken } from "../services/gigachatAuth.ts";
 import { getRegistryEntry } from "../config/providerRegistry.ts";
+import { getModelTargetFormat } from "../config/providerModels.ts";
 import {
   mergeClientAnthropicBeta,
   normalizeAnthropicHeaderVariants,
@@ -22,22 +19,42 @@ import { isOfficialAnthropicBaseUrl } from "../utils/anthropicHost.ts";
 import { applyProviderRequestDefaults } from "../services/providerRequestDefaults.ts";
 import { stripUnsupportedParams } from "../translator/paramSupport.ts";
 import {
+  injectReasoningContentForThinkingModel,
+  shouldInjectReasoningContentPlaceholder,
+} from "../utils/reasoningContentInjector.ts";
+import {
   detectFormat,
   getOpenAICompatibleType,
   getTargetFormat,
   isClaudeCodeCompatible,
 } from "../services/provider.ts";
-import { sanitizeQwenThinkingToolChoice } from "../services/qwenThinking.ts";
-import { buildDataRobotChatUrl } from "../config/datarobot.ts";
-import { buildAzureAiChatUrl } from "../config/azureAi.ts";
-import { buildWatsonxChatUrl } from "../config/watsonx.ts";
-import { buildOciChatUrl } from "../config/oci.ts";
-import { buildSapChatUrl, getSapResourceGroup } from "../config/sap.ts";
+import { getSapResourceGroup } from "../config/sap.ts";
+import {
+  normalizeBailianMessagesUrl,
+  normalizeDataRobotChatUrl,
+  normalizeAzureAiChatUrl,
+  normalizeWatsonxChatUrl,
+  normalizeOciChatUrl,
+  normalizeSapChatUrl,
+  normalizeXiaomiMimoChatUrl,
+  normalizeOpenAIChatUrl,
+  getOpenRouterConnectionPreset,
+} from "./default/urlNormalizers.ts";
 import { buildMaritalkChatUrl } from "../config/maritalk.ts";
 import { LOCAL_PROVIDERS } from "@/shared/constants/providers";
 import { isForbiddenCustomHeaderName } from "@/shared/constants/upstreamHeaders";
 import { getClaudeCodeCompatibleRequestDefaults } from "@/lib/providers/requestDefaults";
-import { buildClineHeaders } from "@/shared/utils/clineAuth";
+import { applyClineAuthHeaders } from "@/shared/utils/clineAuth";
+import {
+  normalizeHerokuChatUrl,
+  normalizeDatabricksChatUrl,
+  normalizeSnowflakeChatUrl,
+  normalizeGigachatChatUrl,
+} from "@/lib/providers/validation/urlHelpers";
+import { forwardOpencodeClientHeaders } from "../utils/opencodeHeaders.ts";
+import { resolveZaiUrl } from "./default/zaiFormatOverride.ts";
+import { acquireNvidiaConcurrencySlot } from "./default/nvidiaConcurrencyGate.ts";
+import { resolveAlibabaProviderBaseUrl } from "@/shared/constants/alibabaProviderRegions";
 
 import type { PoolConfig } from "../services/sessionPool/types.ts";
 
@@ -83,90 +100,6 @@ function applyCustomHeaders(headers: Record<string, string>, rawCustomHeaders: u
   }
 }
 
-function normalizeBaseUrl(baseUrl) {
-  return (baseUrl || "").trim().replace(/\/$/, "");
-}
-
-function normalizeBailianMessagesUrl(baseUrl) {
-  const normalized = normalizeBaseUrl(baseUrl).replace(/\?beta=true$/, "");
-  const messagesUrl = normalized.endsWith("/messages") ? normalized : `${normalized}/messages`;
-  return messagesUrl;
-}
-
-function normalizeHerokuChatUrl(baseUrl) {
-  const normalized = normalizeBaseUrl(baseUrl);
-  if (normalized.endsWith("/v1/chat/completions")) return normalized;
-  return `${normalized}/v1/chat/completions`;
-}
-
-function normalizeDatabricksChatUrl(baseUrl) {
-  const normalized = normalizeBaseUrl(baseUrl);
-  if (normalized.endsWith("/chat/completions")) return normalized;
-  return `${normalized}/chat/completions`;
-}
-
-function normalizeDataRobotChatUrl(baseUrl) {
-  return buildDataRobotChatUrl(baseUrl);
-}
-
-function normalizeAzureAiChatUrl(baseUrl: string, apiType: "chat" | "responses" = "chat") {
-  return buildAzureAiChatUrl(baseUrl, apiType);
-}
-
-function normalizeWatsonxChatUrl(baseUrl: string) {
-  return buildWatsonxChatUrl(baseUrl);
-}
-
-function normalizeOciChatUrl(baseUrl: string, apiType: "chat" | "responses" = "chat") {
-  return buildOciChatUrl(baseUrl, apiType);
-}
-
-function normalizeSapChatUrl(baseUrl) {
-  return buildSapChatUrl(baseUrl);
-}
-
-function normalizeXiaomiMimoChatUrl(baseUrl) {
-  const normalized = normalizeBaseUrl(baseUrl).replace(/\/chat\/completions$/, "");
-  return `${normalized}/chat/completions`;
-}
-
-function normalizeSnowflakeChatUrl(baseUrl) {
-  const normalized = normalizeBaseUrl(baseUrl)
-    .replace(/\/cortex\/inference:complete$/, "")
-    .replace(/\/api\/v2$/, "");
-  return `${normalized}/api/v2/cortex/inference:complete`;
-}
-
-function normalizeGigachatChatUrl(baseUrl) {
-  const normalized = normalizeBaseUrl(baseUrl).replace(/\/chat\/completions$/, "");
-  return `${normalized}/chat/completions`;
-}
-
-function normalizeOpenAIChatUrl(baseUrl) {
-  const normalized = normalizeBaseUrl(baseUrl);
-  if (
-    normalized.endsWith("/chat/completions") ||
-    normalized.endsWith("/responses") ||
-    normalized.endsWith("/chat")
-  ) {
-    return normalized;
-  }
-  if (normalized.endsWith("/v1")) {
-    return `${normalized}/chat/completions`;
-  }
-  // Assume OpenAI-compatible /v1/chat/completions path structure
-  // when the base URL is a bare hostname or custom path (e.g. llama.cpp, vLLM, LM Studio).
-  return `${normalized}/v1/chat/completions`;
-}
-
-function getOpenRouterConnectionPreset(
-  providerSpecificData?: Record<string, unknown> | null
-): string | null {
-  const preset =
-    typeof providerSpecificData?.preset === "string" ? providerSpecificData.preset.trim() : "";
-  return preset || null;
-}
-
 export class DefaultExecutor extends BaseExecutor {
   constructor(provider) {
     super(provider, PROVIDERS[provider] || PROVIDERS.openai);
@@ -186,8 +119,9 @@ export class DefaultExecutor extends BaseExecutor {
       const normalized = baseUrl.replace(/\/$/, "");
       const customPath = typeof psd?.chatPath === "string" && psd.chatPath ? psd.chatPath : null;
       if (customPath) return `${normalized}${customPath}`;
+      const forceResponses = psd?._omnirouteForceResponsesUpstream === true;
       const path =
-        getOpenAICompatibleType(this.provider, psd) === "responses"
+        forceResponses || getOpenAICompatibleType(this.provider, psd) === "responses"
           ? "/responses"
           : "/chat/completions";
       return `${normalized}${path}`;
@@ -205,21 +139,69 @@ export class DefaultExecutor extends BaseExecutor {
       const normalized = baseUrl.replace(/\/$/, "");
       return `${normalized}${customPath || "/messages"}`;
     }
+    // An alternate protocol selected on the connection carries a complete endpoint
+    // URL, so it must bypass the per-provider normalizers in the switch below —
+    // those assume the provider's default (OpenAI-shaped) path and would mangle it,
+    // e.g. appending "/chat/completions" to an Anthropic ".../v1/messages" endpoint.
+    {
+      const alternate = this.resolveAlternate(credentials);
+      const manualBaseUrl = credentials?.providerSpecificData?.baseUrl;
+      const hasManualBaseUrl = typeof manualBaseUrl === "string" && !!manualBaseUrl;
+      if (alternate?.baseUrl && !hasManualBaseUrl) {
+        // Operator's manual override (#6147) keeps its own semantics and falls
+        // through to the provider-specific handling below.
+        const normalized = alternate.baseUrl.replace(/\/$/, "");
+        return `${normalized}${alternate.chatPath || ""}${alternate.urlSuffix || ""}`;
+      }
+    }
     switch (this.provider) {
+      case "openai": {
+        // #5842: responses-only models (o1-pro / gpt-5.x-pro) 404 on
+        // /v1/chat/completions ("only supported in v1/responses"). Route them to
+        // the native /responses endpoint — the per-model targetFormat (registry tag
+        // + the -pro heuristic in getModelTargetFormat) is the single source of
+        // truth, keeping the URL in lockstep with the chatCore body translation.
+        // Mirrors the gh executor's targetFormat-driven routing (9router#102).
+        const customBaseUrl =
+          typeof credentials?.providerSpecificData?.baseUrl === "string" &&
+          credentials.providerSpecificData.baseUrl.trim()
+            ? (credentials.providerSpecificData.baseUrl as string)
+            : null;
+        const chatUrl = customBaseUrl ? normalizeOpenAIChatUrl(customBaseUrl) : this.config.baseUrl;
+        if (getModelTargetFormat("openai", model) === "openai-responses") {
+          return chatUrl.replace(/\/chat\/completions\/?$/, "/responses");
+        }
+        return chatUrl;
+      }
       case "bailian-coding-plan": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = resolveAlibabaProviderBaseUrl(
+          this.provider,
+          credentials?.providerSpecificData,
+          this.config.baseUrl
+        );
         return normalizeBailianMessagesUrl(baseUrl);
       }
+      case "alibaba":
+      case "alibaba-cn":
+      case "qwen-cloud":
+      case "qwen-cloud-token-plan": {
+        const baseUrl = resolveAlibabaProviderBaseUrl(
+          this.provider,
+          credentials?.providerSpecificData,
+          this.config.baseUrl
+        );
+        return normalizeOpenAIChatUrl(baseUrl);
+      }
       case "heroku": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeHerokuChatUrl(baseUrl);
       }
       case "databricks": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeDatabricksChatUrl(baseUrl);
       }
       case "datarobot": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeDataRobotChatUrl(baseUrl);
       }
       case "azure-ai": {
@@ -229,11 +211,16 @@ export class DefaultExecutor extends BaseExecutor {
           forceResponses || credentials?.providerSpecificData?.apiType === "responses"
             ? "responses"
             : "chat";
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
-        return normalizeAzureAiChatUrl(baseUrl, apiType);
+        const baseUrl = this.resolveBaseUrl(credentials);
+        const apiVersion =
+          typeof credentials?.providerSpecificData?.apiVersion === "string" &&
+          credentials.providerSpecificData.apiVersion.trim()
+            ? credentials.providerSpecificData.apiVersion.trim()
+            : "2024-12-01-preview";
+        return normalizeAzureAiChatUrl(baseUrl, apiType, model, apiVersion);
       }
       case "watsonx": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeWatsonxChatUrl(baseUrl);
       }
       case "oci": {
@@ -243,33 +230,35 @@ export class DefaultExecutor extends BaseExecutor {
           forceResponses || credentials?.providerSpecificData?.apiType === "responses"
             ? "responses"
             : "chat";
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeOciChatUrl(baseUrl, apiType);
       }
       case "sap": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeSapChatUrl(baseUrl);
       }
-      case "xiaomi-mimo": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+      case "xiaomi-mimo":
+      case "xiaomi-mimo-token-plan": {
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeXiaomiMimoChatUrl(baseUrl);
       }
       case "snowflake": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeSnowflakeChatUrl(baseUrl);
       }
       case "gigachat": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeGigachatChatUrl(baseUrl);
       }
       case "maritalk": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return buildMaritalkChatUrl(baseUrl);
       }
       case "siliconflow": {
-        const baseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
+        const baseUrl = this.resolveBaseUrl(credentials);
         return normalizeOpenAIChatUrl(baseUrl);
       }
+      case "ollama-local":
       case "llama-cpp":
       case "lm-studio":
       case "modal":
@@ -292,10 +281,9 @@ export class DefaultExecutor extends BaseExecutor {
         return normalizeOpenAIChatUrl(baseUrl);
       }
       case "zai":
-      case "glm-coding-apikey": {
-        const zaiBaseUrl = credentials?.providerSpecificData?.baseUrl || this.config.baseUrl;
-        return `${zaiBaseUrl}?beta=true`;
-      }
+      case "glm-coding-apikey":
+        // #7364: format override extracted to zaiFormatOverride.ts (file-size ratchet).
+        return resolveZaiUrl(credentials, (fallback) => this.resolveBaseUrl(credentials, fallback));
       case "claude":
       case "glm":
       case "glmt":
@@ -305,10 +293,6 @@ export class DefaultExecutor extends BaseExecutor {
         return `${this.config.baseUrl}?beta=true`;
       case "gemini":
         return `${this.config.baseUrl}/${model}:${stream ? "streamGenerateContent?alt=sse" : "generateContent"}`;
-      case "qwen": {
-        const resourceUrl = credentials?.providerSpecificData?.resourceUrl;
-        return `https://${resourceUrl || "portal.qwen.ai"}/v1/chat/completions`;
-      }
       default: {
         // Honor a user-supplied custom base URL (providerSpecificData.baseUrl) for
         // OpenAI-format providers (e.g. the built-in "openai" provider pointed at a
@@ -333,40 +317,7 @@ export class DefaultExecutor extends BaseExecutor {
   }
 
   buildHeaders(credentials, stream = true, clientHeaders?: Record<string, string> | null) {
-    const headers = { "Content-Type": "application/json", ...this.config.headers };
-
-    // Allow per-provider User-Agent override via environment variable.
-    const providerId = this.config?.id || this.provider;
-    if (providerId) {
-      const envKey = `${providerId.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_USER_AGENT`;
-      const envUA = process.env[envKey]?.trim();
-      if (envUA) {
-        headers["User-Agent"] = envUA;
-        if ("user-agent" in headers) {
-          headers["user-agent"] = envUA;
-        }
-      }
-    }
-
-    // T07: resolve extra keys round-robin locally since DefaultExecutor overrides BaseExecutor buildHeaders
-    const extraKeys =
-      (credentials.providerSpecificData?.extraApiKeys as string[] | undefined) ?? [];
-    const selectedKeyId = (credentials.providerSpecificData as Record<string, unknown> | undefined)
-      ?.selectedKeyId as string | undefined;
-    let effectiveKey = credentials.apiKey;
-    if (extraKeys.length > 0 && credentials.connectionId && credentials.apiKey) {
-      const resolved = resolveKeyForRequest(
-        credentials.connectionId,
-        credentials.apiKey,
-        extraKeys,
-        selectedKeyId ?? null
-      );
-      effectiveKey = resolved?.key ?? credentials.apiKey;
-      if (resolved && credentials.providerSpecificData) {
-        (credentials.providerSpecificData as Record<string, unknown>).selectedKeyId =
-          resolved.keyId;
-      }
-    }
+    const { headers, effectiveKey } = this.buildHeadersPreamble(credentials, stream);
 
     switch (this.provider) {
       case "gemini":
@@ -452,11 +403,14 @@ export class DefaultExecutor extends BaseExecutor {
       case "glm-coding-apikey":
         headers["x-api-key"] = effectiveKey || credentials.accessToken;
         break;
+      case "clinepass": // dual-auth (OAuth or BYOK) — see applyClineAuthHeaders()
+        applyClineAuthHeaders(headers, credentials, effectiveKey, clientHeaders, true);
+        break;
       case "cline":
         // Cline's API requires the bearer token prefixed with `workos:` plus a
         // set of Cline client-identification headers; plain `Bearer <token>`
-        // is rejected upstream. buildClineHeaders() emits both.
-        Object.assign(headers, buildClineHeaders(effectiveKey || credentials.accessToken));
+        // is rejected upstream. applyClineAuthHeaders() emits both.
+        applyClineAuthHeaders(headers, credentials, effectiveKey, clientHeaders, false);
         break;
       default:
         if (isClaudeCodeCompatible(this.provider)) {
@@ -505,10 +459,13 @@ export class DefaultExecutor extends BaseExecutor {
             headers["anthropic-version"] = "2023-06-01";
           }
         } else {
-          // Use registry authHeader if available, otherwise default to bearer
+          // Use registry authHeader if available, otherwise default to bearer.
+          // An alternate protocol selected on the connection carries its own auth
+          // scheme (e.g. claude uses x-api-key where openai uses bearer).
           const entry = getRegistryEntry(this.provider);
-          const authHeader = entry?.authHeader || "bearer";
-          const token = effectiveKey || credentials.accessToken;
+          const alternate = this.resolveAlternate(credentials);
+          const authHeader = alternate?.authHeader || entry?.authHeader || "bearer";
+          const token = effectiveKey || credentials.accessToken || entry?.anonymousApiKey;
           if (token) {
             if (authHeader === "x-api-key") {
               headers["x-api-key"] = token;
@@ -523,16 +480,6 @@ export class DefaultExecutor extends BaseExecutor {
 
     headers["Accept"] = stream ? "text/event-stream" : "application/json";
 
-    // Qwen header cleanup: Remove X-Dashscope-* headers if using an API key (DashScope compatible mode).
-    // If using OAuth (Qwen Code), we MUST keep them for portal.qwen.ai to accept the request.
-    if (this.provider === "qwen" && effectiveKey) {
-      for (const key of Object.keys(headers)) {
-        if (key.toLowerCase().startsWith("x-dashscope-")) {
-          delete headers[key];
-        }
-      }
-    }
-
     const isCompatibleProvider =
       this.provider?.startsWith?.("openai-compatible-") ||
       this.provider?.startsWith?.("anthropic-compatible-");
@@ -544,25 +491,7 @@ export class DefaultExecutor extends BaseExecutor {
     // Forward client request metadata headers (from OpenCode or similar clients)
     // Allowlist-based: only specific x-opencode-* headers and User-Agent are forwarded
     if (clientHeaders) {
-      const clientUA = clientHeaders["User-Agent"] || clientHeaders["user-agent"];
-      if (clientUA) {
-        setUserAgentHeader(headers, clientUA);
-      }
-
-      const opencodeHeaderKeys = [
-        "x-opencode-session",
-        "x-opencode-request",
-        "x-opencode-project",
-        "x-opencode-client",
-      ];
-      for (const headerName of opencodeHeaderKeys) {
-        const value = Object.entries(clientHeaders).find(
-          ([key]) => key.toLowerCase() === headerName.toLowerCase()
-        )?.[1];
-        if (value) {
-          headers[headerName] = value;
-        }
-      }
+      forwardOpencodeClientHeaders(headers, clientHeaders);
 
       // #3974: merge the client's negotiated anthropic-beta (allowlisted) into the
       // outbound set. The registry's static ANTHROPIC_BETA_CLAUDE_OAUTH lacks
@@ -596,8 +525,7 @@ export class DefaultExecutor extends BaseExecutor {
 
     const record = body as Record<string, unknown>;
     const rf = record.response_format as
-      | { type?: string; json_schema?: { schema?: unknown } }
-      | undefined;
+      { type?: string; json_schema?: { schema?: unknown } } | undefined;
     if (rf?.type !== "json_schema" || !rf.json_schema?.schema) return body;
 
     const schemaJson = JSON.stringify(rf.json_schema.schema, null, 2);
@@ -651,8 +579,9 @@ export class DefaultExecutor extends BaseExecutor {
     withDefaults = this.defaultResponsesTextFormat(withDefaults);
 
     // Port of decolua/9router commit d652300e:
-    // Cerebras returns 400 (wrong_api_format) and Mistral returns 422
-    // (extra_forbidden) when the forwarded body carries `client_metadata`
+    // Cerebras returns 400 (wrong_api_format), Mistral returns 422
+    // (extra_forbidden), and NVIDIA's OpenAI-compatible wrapper returns 400
+    // (Unsupported parameter) when the forwarded body carries `client_metadata`
     // (an OpenAI Codex / Claude CLI passthrough field with no equivalent on
     // these upstreams). Strip it before sending downstream. Other providers
     // (notably `openai` / `codex`) intentionally keep it.
@@ -660,12 +589,47 @@ export class DefaultExecutor extends BaseExecutor {
       withDefaults &&
       typeof withDefaults === "object" &&
       !Array.isArray(withDefaults) &&
-      (this.provider === "cerebras" || this.provider === "mistral") &&
+      (this.provider === "cerebras" || this.provider === "mistral" || this.provider === "nvidia") &&
       Object.prototype.hasOwnProperty.call(withDefaults, "client_metadata")
     ) {
       const withoutClientMetadata = { ...(withDefaults as Record<string, unknown>) };
       delete withoutClientMetadata.client_metadata;
       withDefaults = withoutClientMetadata;
+    }
+
+    // 9router#1649: Mistral's API returns 422 (extra_forbidden) when an
+    // assistant message carries a `reasoning_content` field (replayed thinking
+    // from a prior turn, e.g. via the Codex /responses path). The field is
+    // nested per-message, so the generic top-level 400/field-downgrade retry
+    // doesn't cover it. Strip it from every message before sending — scoped to
+    // Mistral so DeepSeek (which *requires* replayed reasoning_content) is
+    // unaffected.
+    if (
+      this.provider === "mistral" &&
+      withDefaults &&
+      typeof withDefaults === "object" &&
+      !Array.isArray(withDefaults) &&
+      Array.isArray((withDefaults as Record<string, unknown>).messages)
+    ) {
+      const record = withDefaults as Record<string, unknown>;
+      const messages = record.messages as unknown[];
+      let mutated = false;
+      const cleaned = messages.map((msg) => {
+        if (
+          msg &&
+          typeof msg === "object" &&
+          !Array.isArray(msg) &&
+          Object.prototype.hasOwnProperty.call(msg, "reasoning_content")
+        ) {
+          mutated = true;
+          const { reasoning_content: _dropped, ...rest } = msg as Record<string, unknown>;
+          return rest;
+        }
+        return msg;
+      });
+      if (mutated) {
+        withDefaults = { ...record, messages: cleaned };
+      }
     }
 
     const targetFormat = getTargetFormat(this.provider, credentials?.providerSpecificData);
@@ -682,21 +646,11 @@ export class DefaultExecutor extends BaseExecutor {
           withDefaults = withoutStreamOptions;
         }
       } else if (stream && targetFormat === "openai" && requestFormat !== "openai-responses") {
-        // Port of decolua/9router#663 (closes upstream #557): Qwen rejects with
-        // 400 "'stream_options' only set this when you set stream: true" when the
-        // outgoing body carries `stream: false` (Claude Code / Claude-Code-
-        // compatible callers force the executor-level stream flag on via
-        // `upstreamStream = stream || isClaudeCodeCompatible`, but the body keeps
-        // the caller's original `stream: false`). Same upstream also rejects the
-        // injection when `thinking` / `enable_thinking` is set. Skip injection in
-        // those cases instead of unconditionally adding `stream_options`.
+        // Do not inject stream_options when the outgoing body explicitly disables streaming.
         const defaultsRecord = withDefaults as Record<string, unknown>;
-        const qwenBlocksStreamOptions =
-          this.provider === "qwen" &&
-          (defaultsRecord.stream === false ||
-            Boolean(defaultsRecord.thinking) ||
-            Boolean(defaultsRecord.enable_thinking));
-        if (qwenBlocksStreamOptions) {
+        const bodyDisablesStreamOptions =
+          defaultsRecord.stream !== undefined && defaultsRecord.stream !== true;
+        if (bodyDisablesStreamOptions) {
           if (Object.prototype.hasOwnProperty.call(defaultsRecord, "stream_options")) {
             const withoutStreamOptions = { ...defaultsRecord };
             delete withoutStreamOptions.stream_options;
@@ -705,6 +659,7 @@ export class DefaultExecutor extends BaseExecutor {
         } else if (!credentials?.providerSpecificData?.disableStreamOptions) {
           withDefaults = {
             ...withDefaults,
+            stream: true,
             stream_options: {
               ...((defaultsRecord.stream_options as object) || {}),
               include_usage: true,
@@ -734,7 +689,7 @@ export class DefaultExecutor extends BaseExecutor {
 
       // #1961: Map max_tokens -> max_completion_tokens for recent OpenAI models
       if (targetFormat === "openai") {
-        const isRecentOpenAI = /^(o1|o3|o4|gpt-5)/i.test(model);
+        const isRecentOpenAI = /^(?:openai\/)?(?:o1|o3|o4|gpt-5)/i.test(model);
         if (isRecentOpenAI && withDefaults && typeof withDefaults === "object") {
           const defaultsRecord = withDefaults as Record<string, unknown>;
           if ("max_tokens" in defaultsRecord) {
@@ -755,22 +710,15 @@ export class DefaultExecutor extends BaseExecutor {
       }
     }
 
-    if (this.provider === "qwen" && typeof withDefaults === "object" && withDefaults !== null) {
-      return sanitizeQwenThinkingToolChoice(
-        withDefaults as Record<string, unknown>,
-        "QwenExecutor"
-      );
-    }
-
     // Config-driven strip of params unsupported by the target provider/model
     // (e.g. claude-opus-4 deprecated `temperature` → Anthropic 400). Port from
     // 9router#7ae9fff6 (fixes upstream #1748). Rules live in
     // ../translator/paramSupport.ts so adding one means editing one table.
     if (typeof withDefaults === "object" && withDefaults !== null) {
       const bodyRecord = withDefaults as Record<string, unknown>;
-      const outboundModel =
-        typeof bodyRecord.model === "string" ? bodyRecord.model : model;
-      stripUnsupportedParams(this.provider, outboundModel, bodyRecord);
+      const outboundModel = typeof bodyRecord.model === "string" ? bodyRecord.model : model;
+      withDefaults = mapNvidiaGlm52ReasoningParams(bodyRecord, this.provider, outboundModel);
+      stripUnsupportedParams(this.provider, outboundModel, withDefaults as Record<string, unknown>);
     }
 
     // Apply modelIdPrefix from RegistryEntry (e.g. "accounts/fireworks/models/")
@@ -793,7 +741,69 @@ export class DefaultExecutor extends BaseExecutor {
       }
     }
 
+    // Reasoning models burn all of max_tokens on the thinking phase when the budget is too
+    // small, leaving content empty (finish_reason: "length"); applies to all providers (#6912).
+    if (typeof withDefaults === "object" && withDefaults !== null) {
+      this.ensureThinkingBudget(withDefaults as Record<string, unknown>, model);
+    }
+
+    // 9router#1480: native Moonshot providers 400 when a prior assistant turn
+    // lacks reasoning_content. OpencodeExecutor
+    // already injects a placeholder for OpenCode-routed thinking models; the
+    // direct connections hit neither injection path. Scope to Moonshot ids so
+    // gateway-served models that merely match the thinking-model name pattern
+    // (and may reject an extra field) are unaffected.
+    if (this.provider === "kimi" || this.provider === "moonshot") {
+      const outboundModel =
+        typeof (withDefaults as Record<string, unknown>)?.model === "string"
+          ? ((withDefaults as Record<string, unknown>).model as string)
+          : model;
+      if (shouldInjectReasoningContentPlaceholder(this.provider, outboundModel)) {
+        withDefaults = injectReasoningContentForThinkingModel(withDefaults);
+      }
+    }
+
     return withDefaults;
+  }
+
+  // Reasoning models (ClinePass, OpenRouter, etc.) leave content empty when the reasoning
+  // budget consumes all of max_tokens; bump max_tokens to a safe minimum when undersized.
+  ensureThinkingBudget(body: Record<string, unknown>, model: string): Record<string, unknown> {
+    if (!body) return body;
+
+    const outboundModel = typeof body.model === "string" ? body.model : model;
+    const entry = getRegistryEntry(this.provider);
+    const modelEntry = entry?.models?.find((m) => m.id === outboundModel);
+    if (!modelEntry?.supportsReasoning) return body;
+
+    const extraBody = body.extra_body as Record<string, unknown> | undefined;
+    const thinking = extraBody?.thinking as Record<string, unknown> | undefined;
+    const effort = body.reasoning_effort;
+    const reasoningEnabled =
+      thinking?.type === "enabled" ||
+      (typeof effort === "string" && effort !== "none" && effort !== "off") ||
+      effort === true;
+    if (!reasoningEnabled) return body;
+
+    const MIN_TOKENS = 4096;
+    const maxOutput =
+      typeof modelEntry.maxOutputTokens === "number" && modelEntry.maxOutputTokens > 0
+        ? modelEntry.maxOutputTokens
+        : MIN_TOKENS;
+    const target = Math.min(MIN_TOKENS, maxOutput);
+    const current = body.max_tokens ?? body.max_completion_tokens;
+
+    // #6912: keep whichever token key transformRequest already set (o1/o3/o4/gpt-5 use
+    // max_completion_tokens) instead of re-introducing max_tokens alongside it.
+    const tokenKey =
+      body.max_completion_tokens !== undefined ? "max_completion_tokens" : "max_tokens";
+
+    if (typeof current !== "number" || current <= 0) {
+      body[tokenKey] = target;
+    } else if (current < MIN_TOKENS && current < maxOutput) {
+      body[tokenKey] = MIN_TOKENS;
+    }
+    return body;
   }
 
   /**
@@ -831,6 +841,20 @@ export class DefaultExecutor extends BaseExecutor {
   }
 
   async execute(input: ExecuteInput) {
+    // #6846 Phase 1: per-connection concurrency cap for nvidia — no-op for every
+    // other provider (returns null immediately, no semaphore key allocated).
+    const releaseNvidiaSlot = await acquireNvidiaConcurrencySlot(
+      this.provider,
+      input.credentials?.connectionId
+    );
+    try {
+      return await this.executeWithSessionPool(input);
+    } finally {
+      releaseNvidiaSlot?.();
+    }
+  }
+
+  private async executeWithSessionPool(input: ExecuteInput) {
     const pool = this.getPool();
     if (!pool) return super.execute(input);
 

@@ -1,10 +1,4 @@
-import { randomUUID } from "crypto";
-import {
-  BaseExecutor,
-  setUserAgentHeader,
-  type ExecuteInput,
-  type ProviderCredentials,
-} from "./base.ts";
+import { BaseExecutor, type ExecuteInput, type ProviderCredentials } from "./base.ts";
 import { PROVIDERS } from "../config/constants.ts";
 import { getModelTargetFormat } from "../config/providerModels.ts";
 import {
@@ -12,6 +6,7 @@ import {
   isThinkingMessageModel,
 } from "../utils/reasoningContentInjector.ts";
 import { runWithProxyContext } from "../utils/proxyFetch.ts";
+import { forwardOpencodeClientHeaders } from "../utils/opencodeHeaders.ts";
 
 /**
  * Per-account proxy configuration, persisted by NoAuthAccountCard under
@@ -26,6 +21,7 @@ export interface OpencodeAccountProxyConfig {
     port: number;
     username?: string;
     password?: string;
+    relayAuth?: string;
   } | null;
 }
 
@@ -41,6 +37,54 @@ interface OpencodeAccountState {
 
 const OPENCODE_COOLDOWN_BASE_MS = 5_000;
 const OPENCODE_COOLDOWN_MAX_MS = 60_000;
+
+const EFFORT_LEVELS = ["low", "medium", "high", "max"] as const;
+
+/**
+ * Models on opencode-go that support effort-tier aliases. Each entry maps the
+ * canonical base id to the set of effort suffixes the upstream supports.
+ *
+ * - deepseek-v4-pro: all four tiers (low/medium/high/max)
+ * - glm-5.2: high/max only (Z.AI maps these through the reasoning plane;
+ *   low/medium are not supported on the OpenAI transport)
+ * - mimo-v2.5: high/max only (same reasoning; Xiaomi MiMo does not document
+ *   low/medium effort tiers)
+ * - #8353 OpenCode Go registry effort variants (exact suffix sets from
+ *   `opencode models opencode-go --verbose`; MiniMax M3 excluded — different
+ *   thinking-mode mapping):
+ *   deepseek-v4-flash high/max; grok-4.5 low/medium/high; hy3 none/low/high;
+ *   kimi-k3 max; qwen3.6-plus / qwen3.7-max / qwen3.7-plus high/max
+ */
+const EFFORT_TIERS: Record<string, readonly string[]> = {
+  "deepseek-v4-pro": EFFORT_LEVELS,
+  "deepseek-v4-flash": ["high", "max"],
+  "glm-5.2": ["high", "max"],
+  "mimo-v2.5": ["high", "max"],
+  "grok-4.5": ["low", "medium", "high"],
+  hy3: ["none", "low", "high"],
+  "kimi-k3": ["max"],
+  "qwen3.6-plus": ["high", "max"],
+  "qwen3.7-max": ["high", "max"],
+  "qwen3.7-plus": ["high", "max"],
+};
+
+/**
+ * Parse a model string with an effort-level suffix.
+ * e.g. "deepseek-v4-pro-low" → { baseModel: "deepseek-v4-pro", effort: "low" }
+ *      "glm-5.2-high"         → { baseModel: "glm-5.2", effort: "high" }
+ * Returns null if the model doesn't match any known effort-tier pattern.
+ */
+export function parseEffortLevel(model: string): { baseModel: string; effort: string } | null {
+  const m = String(model || "");
+  for (const [baseModel, levels] of Object.entries(EFFORT_TIERS)) {
+    for (const level of levels) {
+      if (m === `${baseModel}-${level}`) {
+        return { baseModel, effort: level };
+      }
+    }
+  }
+  return null;
+}
 
 export class OpencodeExecutor extends BaseExecutor {
   _requestFormat: string | null = null;
@@ -152,10 +196,16 @@ export class OpencodeExecutor extends BaseExecutor {
       for (let attempt = 0; attempt < this.accounts.length; attempt++) {
         const account = this.pickAccount();
         const masked = OpencodeExecutor.maskAccountId(account.fingerprint);
-        log?.debug?.(
+        // #5217 (Gap 2): promoted debug→info so the per-request account/proxy
+        // rotation selection is visible in the Console log view at the default
+        // APP_LOG_LEVEL=info (users could not see which account/proxy was used).
+        // Token stays masked — never log the full account id.
+        log?.info?.(
           "OPENCODE",
           `dispatch via account ${masked} (idx ${attempt + 1}/${this.accounts.length})` +
-            (account.proxy ? ` through proxy ${account.proxy.host}:${account.proxy.port}` : " direct")
+            (account.proxy
+              ? ` through proxy ${account.proxy.host}:${account.proxy.port}`
+              : " direct")
         );
 
         // Pin egress to this account's proxy for the whole BaseExecutor dispatch
@@ -169,10 +219,7 @@ export class OpencodeExecutor extends BaseExecutor {
         const status = result.response.status;
         if (status === 429) {
           this.markCooldown(account);
-          log?.warn?.(
-            "OPENCODE",
-            `Rate limited (429) on account ${masked}, rotating to next…`
-          );
+          log?.warn?.("OPENCODE", `Rate limited (429) on account ${masked}, rotating to next…`);
           continue;
         }
 
@@ -216,7 +263,11 @@ export class OpencodeExecutor extends BaseExecutor {
     model?: string
   ) {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
-    const key = credentials?.apiKey || credentials?.accessToken;
+    // #8467: honor Extra API Keys rotation via BaseExecutor.resolveEffectiveKey.
+    // Fall back to accessToken only when no apiKey/extras resolve to a key.
+    const key = credentials
+      ? this.resolveEffectiveKey(credentials) || credentials.accessToken
+      : undefined;
 
     if (key) {
       if (this._requestFormat === "claude") {
@@ -234,60 +285,36 @@ export class OpencodeExecutor extends BaseExecutor {
       headers["Accept"] = "text/event-stream";
     }
 
-    if (clientHeaders) {
-      const clientUA = clientHeaders["User-Agent"] || clientHeaders["user-agent"];
-      if (clientUA) {
-        setUserAgentHeader(headers, clientUA);
-      }
+    // Opt-in (#5997): synthesize OpenCode CLI identity headers the client did not send.
+    // Cloudflare in front of opencode.ai/zen/go 403s server-side (VPS) requests lacking
+    // CLI identity, but the forward-only default is deliberate — fabricating a WRONG
+    // value risks upstream rejection (#5720 regressed with "opencode/local"), and this
+    // is deployment-specific. So it stays OFF by default and the VPS operator enables it
+    // with OPENCODE_SYNTHESIZE_CLI_HEADERS=true (values env-overridable). Client-supplied
+    // headers always take precedence.
+    const synthesizeCli = /^(1|true|yes|on)$/i.test(
+      process.env.OPENCODE_SYNTHESIZE_CLI_HEADERS?.trim() ?? ""
+    );
+    const cliDefaults = synthesizeCli
+      ? (() => {
+          const providerId = this.config?.id || this.provider || "opencode";
+          const envUAKey = `${providerId.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_USER_AGENT`;
+          return {
+            userAgent:
+              process.env[envUAKey]?.trim() ||
+              process.env.OPENCODE_USER_AGENT?.trim() ||
+              "opencode-cli/1.0.0",
+            client: process.env.OPENCODE_CLIENT?.trim() || "cli",
+            project: process.env.OPENCODE_PROJECT?.trim() || "default",
+          };
+        })()
+      : undefined;
 
-      // Forward OpenCode request metadata headers from client
-      const findClientHeader = (name: string) =>
-        Object.entries(clientHeaders).find(
-          ([key]) => key.toLowerCase() === name.toLowerCase()
-        )?.[1];
-
-      const opencodeHeaderKeys = [
-        "x-opencode-session",
-        "x-opencode-request",
-        "x-opencode-project",
-        "x-opencode-client",
-      ];
-      for (const headerName of opencodeHeaderKeys) {
-        const value = findClientHeader(headerName);
-        if (value) {
-          headers[headerName] = value;
-        }
-      }
-
-      // #4022: OpenCode CLI only emits x-opencode-* headers when the provider id
-      // starts with "opencode". For a custom-named provider (e.g. "omniroute") it
-      // instead sends x-session-affinity / X-Session-Id, which both carry the same
-      // OpenCode sessionID. Map that session id onto x-opencode-session so session
-      // continuity to the opencode.ai upstream works regardless of how the user
-      // named the provider. Scoped to this executor (opencode.ai/zen upstreams
-      // only) — the generic DefaultExecutor intentionally does NOT do this, to
-      // avoid leaking the client session id to arbitrary third-party upstreams.
-      if (!headers["x-opencode-session"]) {
-        const sessionAffinity =
-          findClientHeader("x-session-affinity") || findClientHeader("x-session-id");
-        if (sessionAffinity) {
-          headers["x-opencode-session"] = sessionAffinity;
-
-          // #4465: a custom-named provider only reaches this fallback because the
-          // OpenCode CLI did NOT emit the x-opencode-* set (it only does so when the
-          // provider id starts with "opencode"). It therefore also dropped
-          // x-opencode-request, a per-request correlation id. Synthesize one so these
-          // users are not disadvantaged versus opencode-prefixed providers on the
-          // opencode.ai upstream. x-opencode-client / x-opencode-project are NOT
-          // fabricated: their valid values are opencode-internal and inventing them
-          // could be rejected upstream — they remain forward-only above. Scoped to this
-          // executor (opencode.ai/zen) and only to the fallback path, so the direct
-          // OpenCode CLI flow (which controls its own request id) is untouched.
-          if (!headers["x-opencode-request"]) {
-            headers["x-opencode-request"] = randomUUID();
-          }
-        }
-      }
+    if (clientHeaders || cliDefaults) {
+      forwardOpencodeClientHeaders(headers, clientHeaders ?? {}, {
+        synthesizeRequestId: true,
+        cliDefaults,
+      });
     }
 
     void model;
@@ -302,26 +329,32 @@ export class OpencodeExecutor extends BaseExecutor {
     credentials: ProviderCredentials
   ): any {
     let modifiedBody = super.transformRequest(model, body, stream, credentials);
+    // 9router#1442: OpenCode upstreams (e.g. kimi-k2.6 via opencode-go) return
+    // 400 "Extra inputs are not permitted, field: 'client_metadata'" — an
+    // OpenAI-Codex/Claude-CLI passthrough field with no equivalent here. The
+    // DefaultExecutor strip only covers cerebras/mistral, and OpencodeExecutor
+    // extends BaseExecutor directly, so nothing removed it on this path.
     if (
       modifiedBody &&
       typeof modifiedBody === "object" &&
-      Array.isArray(modifiedBody.tools) &&
-      modifiedBody.tools.length > 128
+      !Array.isArray(modifiedBody) &&
+      Object.prototype.hasOwnProperty.call(modifiedBody, "client_metadata")
     ) {
-      modifiedBody.tools = modifiedBody.tools.slice(0, 128);
+      delete (modifiedBody as Record<string, unknown>).client_metadata;
     }
     if (modifiedBody && typeof modifiedBody === "object" && !Array.isArray(modifiedBody)) {
       const mb = modifiedBody as Record<string, unknown>;
-      const m = String(model || "");
-      const effortLevels = ["low", "medium", "high", "max"] as const;
-      const matchedLevel = effortLevels.find((level) => m.endsWith(`-${level}`));
-      if (matchedLevel) {
-        const base = m.slice(0, -matchedLevel.length - 1);
-        if (base.toLowerCase() === "deepseek-v4-pro") {
-          mb.model = "deepseek-v4-pro";
-          if (mb.reasoning_effort === undefined) {
-            mb.reasoning_effort = matchedLevel;
-          }
+      if (Array.isArray(mb.tools) && mb.tools.length > 128) {
+        mb.tools = mb.tools.slice(0, 128);
+      }
+    }
+    if (modifiedBody && typeof modifiedBody === "object" && !Array.isArray(modifiedBody)) {
+      const mb = modifiedBody as Record<string, unknown>;
+      const parsed = parseEffortLevel(model);
+      if (parsed) {
+        mb.model = parsed.baseModel;
+        if (mb.reasoning_effort === undefined) {
+          mb.reasoning_effort = parsed.effort;
         }
       }
     }

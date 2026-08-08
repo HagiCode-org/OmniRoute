@@ -1,17 +1,17 @@
 ---
 title: "Release Checklist"
-version: 3.8.2
-lastUpdated: 2026-05-13
+version: 3.8.40
+lastUpdated: 2026-06-28
 ---
 
 # Release Checklist
 
-> **Last updated:** 2026-05-13 — v3.8.0
+> **Last updated:** 2026-06-28 — v3.8.40
 > Streamlined release flow that leverages Claude Code skills for automation.
 >
-> **Manter a fila/branch verdes entre releases:** veja [RELEASE_GREEN.md](./RELEASE_GREEN.md)
-> (família `/green-prs` + `npm run check:release-green` + `/babysit` + nightly). Rodar
-> periodicamente — e principalmente **antes** deste checklist — faz a release PR nascer verde.
+> **Keep the queue/branch green between releases:** see [RELEASE_GREEN.md](./RELEASE_GREEN.md)
+> (`/green-prs` family + `npm run check:release-green` + `/babysit` + nightly). Running
+> this periodically — and especially **before** this checklist — makes the release PR start green.
 
 ## TL;DR
 
@@ -21,7 +21,7 @@ lastUpdated: 2026-05-13
 
 # 2. Run quality gate locally
 npm run check              # lint + tests
-npm run test:coverage      # full coverage gate (75/75/75/70)
+npm run test:coverage      # full coverage gate (60/60/60/60)
 
 # 3. Build & smoke
 npm run build
@@ -36,6 +36,56 @@ npm run test:e2e           # optional but recommended
 # 6. Capture release evidences (skill)
 /capture-release-evidences-cc
 ```
+
+## npm Staged Publishing (default since v3.8.49 — WS1.3/D2)
+
+The npm-publish workflow no longer publishes directly: it boots the packed tarball
+(`check:pack-boot`) and then runs `npm stage publish` — the exact bytes are parked on
+the registry, **not installable** until the owner approves. The human 2FA gate moved
+to AFTER the proof, not before it.
+
+**Owner flow after the workflow goes green:**
+
+1. `npm stage list omniroute` — find the stage id (also printed in the workflow summary).
+2. Verify the staged bytes (recommended): `npm stage download <id>`, then install the
+   downloaded tarball into a temp prefix and boot it (`npm run check:pack-boot` automates
+   the same pack→install→boot verdict in CI).
+3. `npm stage approve <id>` — the 2FA prompt IS the publish. `npm stage reject <id>` discards.
+4. Post-publish net: the post-publish verifier (WS1.4 of the v3.8.49 plan) installs the
+   published version from the public registry in a clean container and boots it.
+
+**Emergency fallback:** `workflow_dispatch` with `publish_mode=direct` restores the
+legacy immediate `npm publish` (use only if staging itself misbehaves; record why).
+
+**One-time hardening (owner, npmjs.com):** configure the Trusted Publisher for
+`omniroute` in stage-only mode so a leaked long-lived token cannot `npm publish`
+directly from anywhere — CI can only stage; only the owner's 2FA releases.
+
+**Broken-artifact playbook (unchanged):** `npm deprecate omniroute@<bad> "<reason> — use <fixed>"`
+as the default reflex (minutes, reversible); `npm unpublish` only inside the 72h/no-dependents
+window and never as the first move. Docker: never rewrite a version tag — rollback is
+repointing `latest` to the last good digest.
+## Hotfix Fast-Lane (label `hotfix`)
+
+A PR labeled `hotfix` skips the heavy CI matrix (9-shard E2E, coverage ratchet,
+quality-gate, quality-extended) and keeps the fast, high-signal gates: build,
+unit shards, integration, vitest, lint/typecheck, docs-sync, `check:pack-artifact`
+and the tarball boot-smoke (`check:pack-boot`). Target: green in ≤15min instead of ~33min.
+
+**Entry policy — all four required (modeled on Chromium/VS Code/Node emergency lanes):**
+
+1. **Severity**: production is broken — a published artifact crashes on boot / a
+   security fix / every user of the release is affected. "Important" is not "broken".
+2. **Authority**: only the repository owner applies the `hotfix` label. The label IS
+   the approval — never self-serve on a campaign PR.
+3. **Evidence**: the PR body links the previous fully-green heavy run (the suite the
+   skipped jobs would re-validate) plus the fix's own failing-then-passing test.
+4. **Scope**: cherry-pick-only — the minimal fix, no refactors, no ride-alongs.
+
+The skipped coverage/ratchet surface is re-validated by the next full run on the
+release branch (continuous release-green) — the lane skips WAITING, never validation.
+Tests-only diffs (all files under `tests/`, none under `tests/e2e/`) skip the E2E
+matrix automatically, without any label.
 
 ## Detailed Checklist
 
@@ -66,13 +116,13 @@ npm run test:e2e           # optional but recommended
 - [ ] `npm run check:cycles` — no circular deps
 - [ ] `npm run check:any-budget:t11` — within budget
 - [ ] `npm run check:route-validation:t06` — clean
-- [ ] `npm run check:node-runtime` — supported floor met (`>=20.20.2 <21`, `>=22.22.2 <23`, `>=24.0.0 <25`)
+- [ ] `npm run check:node-runtime` — supported runtime floor met (`>=22.22.2 <23`, `>=24.0.0 <27`, per `SUPPORTED_NODE_RANGE` in `src/shared/utils/nodeRuntimeSupport.ts`; aligned with `package.json` `engines`)
 
 ### Testing
 
 - [ ] `npm run test:unit` — pass
 - [ ] `npm run test:vitest` — pass (MCP server, autoCombo, cache)
-- [ ] `npm run test:coverage` — gate 75/75/75/70 satisfied (statements/lines/functions/branches)
+- [ ] `npm run test:coverage` — gate 60/60/60/60 satisfied (statements/lines/functions/branches)
 - [ ] `npm run test:integration` — pass (if changes touch DB / handlers)
 - [ ] `npm run test:combo:matrix` — pass (combo strategy matrix: proves all 17 routing strategies' selection decisions deterministically; run when touching combo routing, strategy resolution, or fallback logic)
 - [ ] `RUN_COMBO_LIVE=1 npm run test:combo:live` — **optional/manual** (gated real-upstream smoke; sources a read-only DB snapshot from VPS `root@192.168.0.15`; hits real providers, costs credits; never runs in CI; skips cleanly without the gate)
@@ -86,7 +136,7 @@ npm run test:e2e           # optional but recommended
 Husky hooks live in `.husky/` and run automatically on git operations.
 
 - **pre-commit:** `npx lint-staged + node scripts/check/check-docs-sync.mjs + npm run check:any-budget:t11`
-- **pre-push:** currently disabled (commented out). When re-enabled, runs `npm run test:unit`.
+- **pre-push:** fast deterministic gates — `npm run check:any-budget:t11 && npm run check:tracked-artifacts` (activated 2026-06-13). Intentionally excludes `test:unit` (slow; covered by the CI `test-unit` job).
   - Run `npm run test:unit` manually before pushing release branches.
 
 If a hook fails: fix the underlying issue, don't bypass with `--no-verify`.
@@ -158,11 +208,11 @@ If `electron/` changed:
 
 The repository uses three distinct output directories — never mix them up:
 
-| Directory     | Purpose                                                       | Tracked? |
-| ------------- | ------------------------------------------------------------- | -------- |
-| `src/`        | Application source (TypeScript / TSX)                         | Yes      |
-| `.build/`     | Build intermediates — `next build` output (`distDir`)         | No (gitignored) |
-| `dist/`       | Shippable npm bundle — assembled by `assembleStandalone`      | No (gitignored) |
+| Directory | Purpose                                                  | Tracked?        |
+| --------- | -------------------------------------------------------- | --------------- |
+| `src/`    | Application source (TypeScript / TSX)                    | Yes             |
+| `.build/` | Build intermediates — `next build` output (`distDir`)    | No (gitignored) |
+| `dist/`   | Shippable npm bundle — assembled by `assembleStandalone` | No (gitignored) |
 
 > **Operator note:** the remote VPS image directory remains `/usr/lib/node_modules/omniroute/app/`.
 > Only the **in-repo** build output moved (`app/` → `dist/`). The deploy skills rsync
@@ -312,7 +362,7 @@ If release has critical issue:
 - Never use `git push --force` to `main` or `release/*` branches
 - Never skip Husky hooks (`--no-verify`)
 - Never commit secrets, credentials, or `.env` files
-- Coverage must stay ≥75/75/75/70 (statements/lines/functions/branches)
+- Coverage must stay ≥60/60/60/60 (statements/lines/functions/branches)
 - Always include or update tests when changing production code in `src/`, `open-sse/`, `electron/`, or `bin/`
 
 ## Automated Sync Check

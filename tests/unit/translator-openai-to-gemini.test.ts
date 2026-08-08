@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const { openaiToAntigravityRequest, openaiToGeminiCLIRequest, openaiToGeminiRequest } =
+const { openaiToAntigravityRequest, openaiToCloudCodeGeminiRequest, openaiToGeminiRequest } =
   await import("../../open-sse/translator/request/openai-to-gemini.ts");
 const { getRequestTranslator } = await import("../../open-sse/translator/registry.ts");
 const { FORMATS } = await import("../../open-sse/translator/formats.ts");
@@ -335,8 +335,8 @@ test("OpenAI -> Gemini request preserves custom safety settings and handles syst
   assert.deepEqual(result.contents[0].parts, [{ text: "Only rules" }]);
 });
 
-test("OpenAI -> Gemini CLI adds thinking config and normalizes namespaced tool names", () => {
-  const result = openaiToGeminiCLIRequest(
+test("OpenAI -> Cloud Code Gemini adds thinking config and normalizes namespaced tool names", () => {
+  const result = openaiToCloudCodeGeminiRequest(
     "gemini-2.5-pro",
     {
       messages: [
@@ -385,34 +385,6 @@ test("OpenAI -> Gemini CLI adds thinking config and normalizes namespaced tool n
   );
   assert.ok(responseTurn, "expected a function response turn");
   assert.equal(getFunctionResponse(responseTurn.parts[0]).name, "weather");
-});
-
-test("OpenAI -> Gemini CLI wraps Cloud Code envelope with native top-level and request keys", async () => {
-  const { getRequestTranslator } = await import("../../open-sse/translator/registry.ts");
-  const { FORMATS } = await import("../../open-sse/translator/formats.ts");
-  await import("../../open-sse/translator/request/openai-to-gemini.ts");
-
-  const translate = getRequestTranslator(FORMATS.OPENAI, FORMATS.GEMINI_CLI);
-  assert.ok(translate, "expected Gemini CLI translator to be registered");
-
-  const result = translate(
-    "models/gemini-2.5-flash",
-    { messages: [{ role: "user", content: "Hello" }] },
-    true,
-    { projectId: "projects/demo" }
-  ) as UnknownRecord;
-  const request = result.request as UnknownRecord;
-
-  assert.deepEqual(Object.keys(result), ["model", "project", "user_prompt_id", "request"]);
-  assert.equal(result.model, "gemini-2.5-flash");
-  assert.equal(result.project, "projects/demo");
-  assert.equal(typeof result.user_prompt_id, "string");
-  assert.equal(result.userAgent, undefined);
-  assert.equal(result.requestId, undefined);
-  assert.equal(result.requestType, undefined);
-  assert.equal(typeof request.session_id, "string");
-  assert.equal(request.sessionId, undefined);
-  assert.ok(Array.isArray(request.contents));
 });
 
 test("OpenAI -> Gemini request sanitizes long MCP tool names and strips unsupported schema fields", () => {
@@ -545,33 +517,8 @@ test("OpenAI -> Gemini helper IDs and JSON parsing stay in the expected format",
   assert.equal(tryParseJSON("not-json"), null as any);
 });
 
-test("OpenAI -> Gemini CLI wraps requests like native Cloud Code", () => {
-  const translate = getRequestTranslator(FORMATS.OPENAI, FORMATS.GEMINI_CLI);
-  assert.ok(translate, "expected Gemini CLI translator registration");
-
-  const envelope = translate(
-    "gemini-3-flash-preview",
-    {
-      messages: [{ role: "user", content: "Hello" }],
-      reasoning_effort: "high",
-    },
-    true,
-    { projectId: "project-1" }
-  ) as any;
-
-  assert.equal(envelope.model, "gemini-3-flash-preview");
-  assert.equal(envelope.userAgent, undefined);
-  assert.equal(envelope.requestId, undefined);
-  assert.equal(envelope.request.sessionId, undefined);
-  assert.match(envelope.request.session_id, /^[0-9a-f-]{36}$/i);
-  assert.equal(envelope.user_prompt_id, envelope.request.session_id);
-});
-
-test("OpenAI -> Gemini CLI emits native Cloud Code functionResponse output", () => {
-  const translate = getRequestTranslator(FORMATS.OPENAI, FORMATS.GEMINI_CLI);
-  assert.ok(translate, "expected Gemini CLI translator registration");
-
-  const envelope = translate(
+test("OpenAI -> Cloud Code Gemini emits native functionResponse result", () => {
+  const request = openaiToCloudCodeGeminiRequest(
     "gemini-3-flash-preview",
     {
       messages: [
@@ -593,18 +540,17 @@ test("OpenAI -> Gemini CLI emits native Cloud Code functionResponse output", () 
         },
       ],
     },
-    true,
-    { projectId: "project-1" }
+    true
   ) as any;
 
-  const toolTurn = envelope.request.contents.find(
+  const toolTurn = request.contents.find(
     (content) => content.role === "user" && content.parts.some((part) => part.functionResponse)
   );
-  assert.ok(toolTurn, "expected Gemini CLI tool response turn");
+  assert.ok(toolTurn, "expected Cloud Code Gemini tool response turn");
   assert.deepEqual(getFunctionResponse(toolTurn.parts[0]), {
     id: "read_file_123_0",
     name: "read_file",
-    response: { output: "The answer is capybara-4729." },
+    response: { result: { result: "The answer is capybara-4729." } },
   });
 });
 
@@ -636,13 +582,12 @@ test("OpenAI -> Antigravity wraps Gemini requests in a Cloud Code envelope", () 
     "model",
     "userAgent",
     "requestType",
-    "enabledCreditTypes",
   ]);
   assert.equal(result.userAgent, "antigravity");
   assert.equal(result.requestType, "agent");
   assert.match(result.requestId, /^agent\/\d+\/[0-9a-f]{8}$/);
   assert.match(result.request.sessionId, /^-?\d+$/);
-  assert.deepEqual(result.enabledCreditTypes, ["GOOGLE_ONE_AI"]);
+  assert.equal(result.enabledCreditTypes, undefined);
   assert.equal(result.request.generationConfig.topK, 40);
   assert.equal(result.request.generationConfig.topP, 1.0);
   assert.equal(
@@ -913,7 +858,7 @@ test("OpenAI -> Antigravity maps Claude-family models to Gemini-compatible schem
   assert.equal(result.project, "proj-claude");
   assert.equal(result.userAgent, "antigravity");
   assert.match(result.requestId, /^agent\/\d+\/[0-9a-f]{8}$/);
-  assert.deepEqual((result as any).enabledCreditTypes, ["GOOGLE_ONE_AI"]);
+  assert.equal(result.enabledCreditTypes, undefined);
   assert.equal(result.request.systemInstruction.parts[0].text, ANTIGRAVITY_DEFAULT_SYSTEM);
   assert.equal(result.request.systemInstruction.parts[1].text, "Project rules");
   assert.equal((result as any).request?.generationConfig.maxOutputTokens, undefined);
@@ -1575,4 +1520,96 @@ test("registered OPENAI->GEMINI translator keeps native functionCall+thoughtSign
     false,
     "signed tool call must NOT fall back to context text"
   );
+});
+
+// Regression for #3842: thinking.budget_tokens on the explicit Claude-format path
+// must be capped by the model's thinkingBudgetCap, matching the reasoning_effort path.
+test("OpenAI -> Gemini thinking.budget_tokens is capped by model thinkingBudgetCap (#3842)", () => {
+  // gemini-2.5-flash has thinkingBudgetCap: 24576
+  const result = openaiToGeminiRequest(
+    "gemini-2.5-flash",
+    {
+      messages: [{ role: "user", content: "think hard" }],
+      thinking: { type: "enabled", budget_tokens: 50000 },
+    },
+    false
+  ) as any;
+  assert.equal(result.generationConfig.thinkingConfig.thinkingBudget, 24576);
+  assert.equal(result.generationConfig.thinkingConfig.includeThoughts, true);
+});
+
+test("OpenAI -> Gemini thinking.budget_tokens=0 disables thinking after cap", () => {
+  const result = openaiToGeminiRequest(
+    "gemini-2.5-flash",
+    {
+      messages: [{ role: "user", content: "no thinking" }],
+      thinking: { type: "enabled", budget_tokens: 0 },
+    },
+    false
+  ) as any;
+  assert.equal(result.generationConfig.thinkingConfig.thinkingBudget, 0);
+  assert.equal(result.generationConfig.thinkingConfig.includeThoughts, false);
+});
+
+test("OpenAI -> Gemini thinking.budget_tokens below cap passes through", () => {
+  const result = openaiToGeminiRequest(
+    "gemini-2.5-flash",
+    {
+      messages: [{ role: "user", content: "some thinking" }],
+      thinking: { type: "enabled", budget_tokens: 8192 },
+    },
+    false
+  ) as any;
+  assert.equal(result.generationConfig.thinkingConfig.thinkingBudget, 8192);
+  assert.equal(result.generationConfig.thinkingConfig.includeThoughts, true);
+});
+
+// Guard: models with thinkingBudgetCap=0 (e.g. gemini-3-flash) must NOT
+// receive thinkingConfig even when the caller explicitly sends budget_tokens.
+test("OpenAI -> Gemini skips thinkingConfig for model with thinkingBudgetCap=0", () => {
+  const result = openaiToGeminiRequest(
+    "gemini-3-flash",
+    {
+      messages: [{ role: "user", content: "hello" }],
+      thinking: { type: "enabled", budget_tokens: 5000 },
+    },
+    false
+  ) as any;
+  assert.equal(
+    result.generationConfig.thinkingConfig,
+    undefined,
+    "gemini-3-flash (thinkingBudgetCap:0) must not receive thinkingConfig"
+  );
+});
+
+// Guard: models with thinkingBudgetCap=0 (e.g. gemini-3-flash) still receive
+// thinkingConfig on the reasoning_effort path, clamped to budget 0 / includeThoughts
+// false — matching the pre-#6943 native-defaults contract (see
+// translator-openai-to-gemini-defaults.test.ts). Omitting thinkingConfig entirely
+// here would crash callers that read `.thinkingConfig.thinkingBudget` unconditionally.
+test("OpenAI -> Gemini clamps reasoning_effort thinkingConfig to 0 for model with thinkingBudgetCap=0", () => {
+  const result = openaiToGeminiRequest(
+    "gemini-3-flash",
+    {
+      messages: [{ role: "user", content: "hello" }],
+      reasoning_effort: "high",
+    },
+    false
+  ) as any;
+  assert.equal(result.generationConfig.thinkingConfig.thinkingBudget, 0);
+  assert.equal(result.generationConfig.thinkingConfig.includeThoughts, false);
+});
+
+// Guard: models not in MODEL_SPECS (thinkingBudgetCap=undefined) default to allowed.
+test("OpenAI -> Gemini allows thinkingConfig for unknown model (no spec)", () => {
+  const result = openaiToGeminiRequest(
+    "some-unknown-gemini-model",
+    {
+      messages: [{ role: "user", content: "hello" }],
+      thinking: { type: "enabled", budget_tokens: 5000 },
+    },
+    false
+  ) as any;
+  assert.equal(result.generationConfig.thinkingConfig.thinkingBudget, 5000);
+  assert.equal(result.generationConfig.thinkingConfig.includeThoughts, true);
 });

@@ -18,10 +18,150 @@ import {
   hashToken,
   sanitizeForensicHeader,
 } from "./relaySecurity";
+import {
+  getBifrostRoutingConfig,
+  getRoutingFallbackHeader,
+  getRoutingFallbackReasonHeader,
+  resolveRelayRoutingBackend,
+  shouldTryBifrostForRequest,
+  type BifrostRoutingConfig,
+} from "./routingBackend";
+import { getProviderPluginManifestEntryForModel } from "@omniroute/open-sse/config/providerPluginManifestRegistry.ts";
+import { getProviderPluginManifestHeader } from "@omniroute/open-sse/config/providerPluginManifestUrl.ts";
+import { finalizeReadableStream } from "./streamFinalizer";
+import {
+  clearBifrostFailure,
+  getActiveBifrostCooldown,
+  recordBifrostFailure,
+} from "./bifrostCooldown";
+import type { RelayToken } from "@/lib/db/relayProxies";
 
 const JSON_CORS_HEADERS = { ...CORS_HEADERS, "Content-Type": "application/json" } as const;
 
 const injectionGuard = createInjectionGuard();
+
+type RelayUsageStatus = "success" | "error";
+
+function recordUsage(
+  tokenId: string,
+  request: Request,
+  startTime: number,
+  clientIp: string,
+  userAgent: string | null,
+  status: RelayUsageStatus,
+  statusCode: number
+) {
+  recordRelayUsage(tokenId, {
+    requestId: request.headers.get("x-request-id") || undefined,
+    status,
+    statusCode,
+    latencyMs: Date.now() - startTime,
+    clientIp,
+    userAgent,
+  });
+}
+
+async function forwardToBifrost(
+  request: Request,
+  body: unknown,
+  token: RelayToken,
+  config: BifrostRoutingConfig,
+  backend: ReturnType<typeof resolveRelayRoutingBackend>,
+  startTime: number,
+  clientIp: string,
+  userAgent: string | null
+): Promise<Response> {
+  const wantsStream =
+    Boolean((body as { stream?: boolean } | null)?.stream) && config.streamingEnabled;
+  const upstreamHeaders: Record<string, string> = {
+    "Content-Type": "application/json",
+    "x-relay-token-id": token.id,
+    "x-relay-client-ip": clientIp,
+    ...getProviderPluginManifestHeader(new URL(request.url).origin),
+  };
+  const requestId = request.headers.get("x-request-id");
+  if (requestId) upstreamHeaders["x-request-id"] = requestId;
+  if (config.apiKey) {
+    upstreamHeaders.Authorization = `Bearer ${config.apiKey}`;
+  }
+
+  const ac = new AbortController();
+  let timedOut = false;
+  const tid = setTimeout(() => {
+    timedOut = true;
+    ac.abort();
+  }, config.timeoutMs);
+
+  try {
+    const upstream = await fetch(`${config.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: upstreamHeaders,
+      body: JSON.stringify(body),
+      signal: ac.signal,
+    });
+
+    const headers = new Headers(upstream.headers);
+    headers.set("X-Routed-By", "bifrost");
+    headers.set("X-Routing-Backend", "bifrost");
+    headers.set("X-Relay-Token", token.tokenPrefix + "...");
+    if (!wantsStream) {
+      headers.set("Content-Type", upstream.headers.get("Content-Type") ?? "application/json");
+    }
+
+    if (wantsStream && upstream.body) {
+      const stream = finalizeReadableStream(upstream.body, (error) => {
+        clearTimeout(tid);
+        const statusCode = timedOut ? 504 : upstream.status;
+        if (error && backend === "auto") {
+          recordBifrostFailure(
+            config.baseUrl,
+            timedOut
+              ? `Bifrost sidecar stream timed out after ${config.timeoutMs}ms`
+              : "bifrost-stream-error"
+          );
+        }
+        recordUsage(
+          token.id,
+          request,
+          startTime,
+          clientIp,
+          userAgent,
+          error || statusCode >= 500 ? "error" : "success",
+          statusCode
+        );
+      });
+
+      return new Response(stream, {
+        status: upstream.status,
+        headers,
+      });
+    }
+
+    clearTimeout(tid);
+    recordUsage(
+      token.id,
+      request,
+      startTime,
+      clientIp,
+      userAgent,
+      upstream.status < 500 ? "success" : "error",
+      upstream.status
+    );
+
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers,
+    });
+  } catch (error) {
+    clearTimeout(tid);
+    const isAbort = error instanceof Error && error.name === "AbortError";
+    throw new Error(
+      isAbort
+        ? `Bifrost sidecar timed out after ${config.timeoutMs}ms`
+        : `Bifrost sidecar unreachable: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
 
 export async function OPTIONS() {
   return handleCorsOptions();
@@ -89,7 +229,7 @@ export async function POST(request: Request) {
     }
 
     // 2b. Per-token rate limit check
-    const rateCheck = checkRateLimit(token.id);
+    const rateCheck = checkRateLimit(token.id, token);
     if (!rateCheck.allowed) {
       recordRelayUsage(token.id, {
         requestId: request.headers.get("x-request-id") || undefined,
@@ -112,11 +252,13 @@ export async function POST(request: Request) {
     // 3. Clone request and forward to internal handler
     const cloned = request.clone();
 
+    let parsedBody: unknown = null;
+
     // Prompt injection guard (same as main endpoint)
     try {
-      const body = await cloned.json().catch(() => null);
-      if (body) {
-        const { blocked, result } = injectionGuard(body);
+      parsedBody = await cloned.json().catch(() => null);
+      if (parsedBody) {
+        const { blocked, result } = injectionGuard(parsedBody);
         if (blocked) {
           recordRelayUsage(token.id, {
             requestId: request.headers.get("x-request-id") || undefined,
@@ -142,7 +284,7 @@ export async function POST(request: Request) {
         // Check allowed models
         const allowedModels: string[] = JSON.parse(token.allowedModels);
         if (allowedModels.length > 0 && !allowedModels.includes("*")) {
-          const model = (body as { model?: string }).model || "";
+          const model = (parsedBody as { model?: string }).model || "";
           const allowed = allowedModels.some(
             (p) => model === p || (p.endsWith("*") && model.startsWith(p.slice(0, -1)))
           );
@@ -160,6 +302,54 @@ export async function POST(request: Request) {
       }
     } catch {
       // Continue even if guard fails
+    }
+
+    const backend = resolveRelayRoutingBackend();
+    const bifrostConfig = getBifrostRoutingConfig();
+    let bifrostFallbackReason: string | null = null;
+    const bifrostDecision = shouldTryBifrostForRequest(
+      backend,
+      bifrostConfig,
+      parsedBody,
+      (model) => getProviderPluginManifestEntryForModel(model)?.sidecar ?? null
+    );
+    if (bifrostDecision.fallbackReason) {
+      bifrostFallbackReason = bifrostDecision.fallbackReason;
+    }
+    if (bifrostDecision.tryBifrost) {
+      const cooldown = backend === "auto" ? getActiveBifrostCooldown(bifrostConfig.baseUrl) : null;
+      if (cooldown) {
+        bifrostFallbackReason = `bifrost-cooldown; remaining=${cooldown.remainingMs}`;
+      } else {
+        try {
+          const bifrostResponse = await forwardToBifrost(
+            request,
+            parsedBody,
+            token,
+            bifrostConfig,
+            backend,
+            startTime,
+            clientIp,
+            userAgent
+          );
+          clearBifrostFailure(bifrostConfig.baseUrl);
+          return bifrostResponse;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (backend === "bifrost") {
+            recordUsage(token.id, request, startTime, clientIp, userAgent, "error", 502);
+            return new Response(JSON.stringify(buildErrorBody(502, message)), {
+              status: 502,
+              headers: {
+                ...JSON_CORS_HEADERS,
+                "X-Bifrost-Fallback": "/api/v1/relay/chat/completions",
+              },
+            });
+          }
+          recordBifrostFailure(bifrostConfig.baseUrl, message);
+          bifrostFallbackReason = "bifrost-error";
+        }
+      }
     }
 
     // 4. Proxy to internal handler
@@ -183,6 +373,19 @@ export async function POST(request: Request) {
     // Add relay headers
     const newHeaders = new Headers(response.headers);
     newHeaders.set("X-Relay-Token", token.tokenPrefix + "...");
+    newHeaders.set("X-Routing-Backend", "ts");
+    const routingFallback = getRoutingFallbackHeader(backend, bifrostConfig);
+    if (routingFallback) {
+      // #5526 helper gates emission (auto + enabled); #5519 dynamic cooldown/error
+      // reason wins as the value when set, else falls back to the static "bifrost".
+      newHeaders.set("X-Routing-Fallback", bifrostFallbackReason ?? routingFallback);
+      // #6872: stable, machine-readable companion header — one of the 4 enum
+      // reason codes, or unset when the legacy value has no specific reason.
+      const fallbackReasonCode = getRoutingFallbackReasonHeader(bifrostFallbackReason);
+      if (fallbackReasonCode) {
+        newHeaders.set("X-Routing-Fallback-Reason", fallbackReasonCode);
+      }
+    }
 
     return new Response(response.body, {
       status: response.status,

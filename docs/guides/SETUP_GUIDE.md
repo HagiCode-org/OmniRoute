@@ -1,7 +1,7 @@
 ---
 title: "📖 Setup Guide — OmniRoute"
-version: 3.8.31
-lastUpdated: 2026-06-20
+version: 3.8.40
+lastUpdated: 2026-06-28
 ---
 
 # 📖 Setup Guide — OmniRoute
@@ -34,12 +34,11 @@ Dashboard opens at `http://localhost:20128` and API base URL is `http://localhos
 ### pnpm
 
 ```bash
-pnpm install -g omniroute
-pnpm approve-builds -g   # Select all packages → approve
+pnpm add -g omniroute@latest --allow-build=better-sqlite3 --allow-build=@swc/core
 omniroute
 ```
 
-> **pnpm users:** `pnpm approve-builds -g` is required to enable native build scripts for `better-sqlite3` and `@swc/core`.
+> **pnpm users:** the `--allow-build` flag is required to enable native build scripts for `better-sqlite3` and `@swc/core`. The `pnpm approve-builds -g` command is not supported for global installs on pnpm v11.
 
 ### Arch Linux (AUR)
 
@@ -150,7 +149,7 @@ omniroute providers validate
 ```txt
 Base URL: http://localhost:20128/v1
 API Key:  [copy from Endpoint page]
-Model:    if/kimi-k2-thinking (or any provider/model prefix)
+Model:    if/qwen3.8-max-preview (or any provider/model prefix)
 ```
 
 If your editor cannot send `Authorization: Bearer ...`, use the tokenized compatibility base instead:
@@ -162,7 +161,7 @@ Chat URL: http://localhost:20128/api/v1/vscode/YOUR_KEY/chat/completions
 Ollama Tags URL: http://localhost:20128/api/v1/vscode/YOUR_KEY/api/tags
 ```
 
-Works with Claude Code, Codex CLI, Gemini CLI, Cursor, Cline, OpenClaw, OpenCode, and OpenAI-compatible SDKs.
+Works with Claude Code, Codex CLI, Cursor, Cline, OpenClaw, OpenCode, and OpenAI-compatible SDKs.
 
 #### Auto-configure with `setup-*`
 
@@ -180,9 +179,8 @@ omniroute setup-cursor       # prints Cursor's in-app steps
 omniroute setup-roo          # Roo Code import + autoImport pointer
 omniroute setup-crush        # ~/.config/crush/crush.json
 omniroute setup-goose        # ~/.config/goose/config.yaml
-omniroute setup-qwen         # ~/.qwen/settings.json
 omniroute setup-aider        # ~/.aider.conf.yml
-omniroute setup-gemini       # Gemini CLI (native /v1beta endpoint)
+omniroute setup-qwen         # ~/.qwen/settings.json + ~/.qwen/.env
 ```
 
 Each accepts `--remote <url> --api-key <key>` to configure a local tool against a

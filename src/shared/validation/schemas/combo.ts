@@ -29,6 +29,11 @@ export const comboModelStepInputSchema = z.object({
   model: z.string().trim().min(1).max(300),
   connectionId: z.string().trim().min(1).max(200).nullable().optional(),
   tags: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
+  // Pipeline strategy (open-sse/services/pipeline.ts): an optional per-step
+  // instruction. Steps run in `models` order — each step's output feeds the next
+  // step's input, and this `prompt` is injected as that step's system instruction.
+  // Ignored by every other strategy, so it is fully backward-compatible.
+  prompt: z.string().trim().min(1).max(20000).optional(),
   ...comboStepMetaSchema,
 });
 
@@ -81,6 +86,7 @@ export const scoringWeightsSchema = z
     tierAffinity: z.number().min(0).max(1).optional().default(0.05),
     specificityMatch: z.number().min(0).max(1).optional().default(0.05),
     contextAffinity: z.number().min(0).max(1).optional().default(0.08),
+    cacheAffinity: z.number().min(0).max(1).optional().default(0),
     resetWindowAffinity: z.number().min(0).max(1).optional().default(0),
   })
   .optional();
@@ -109,6 +115,8 @@ export const compressionModeSchema = z.enum([
   "ultra",
   "rtk",
   "stacked",
+  "codex-responses",
+  "omniglyph",
 ]);
 
 export const comboCompressionOverrideSchema = z.union([z.literal(""), compressionModeSchema]);
@@ -122,8 +130,29 @@ export const slaRoutingPolicySchema = z
   })
   .strict();
 
+// Feature 4985 — configurable response-body validation for combo routing. A 200 OK whose
+// body fails this predicate fails over to the next target (same path as an HTTP error).
+export const responseValidationSchema = z
+  .object({
+    forbiddenSubstrings: z.array(z.string().min(1).max(500)).max(50).optional(),
+    requiredSubstrings: z.array(z.string().min(1).max(500)).max(50).optional(),
+    minContentLength: z.coerce.number().int().min(0).max(1_000_000).optional(),
+    jsonPathPredicates: z
+      .array(
+        z.object({
+          path: z.string().trim().min(1).max(300),
+          condition: z.enum(["exists", "nonEmpty", "equals", "notEquals"]),
+          value: z.union([z.string().max(1000), z.number(), z.boolean()]).optional(),
+        })
+      )
+      .max(20)
+      .optional(),
+  })
+  .strict();
+
 export const comboRuntimeConfigSchema = z
   .object({
+    responseValidation: responseValidationSchema.optional(),
     strategy: comboStrategySchema.optional(),
     maxRetries: z.coerce.number().int().min(0).max(10).optional(),
     retryDelayMs: z.coerce.number().int().min(0).max(60000).optional(),
@@ -138,6 +167,12 @@ export const comboRuntimeConfigSchema = z
     // falls back to the global `settings.stickyRoundRobinLimit` so the existing
     // knob still controls the default. 0 clamps to 1 (no batching) upstream.
     stickyRoundRobinLimit: z.coerce.number().int().min(0).max(1000).optional(),
+    // #6168: opt-out for per-conversation session stickiness. When true, round-robin
+    // and random/weighted/priority combos rotate freely instead of pinning a whole
+    // conversation to one connection by the first-message hash. Per-combo `config`
+    // wins over the global `settings.disableSessionStickiness` fallback. Default false
+    // preserves the #3825 prompt-cache/504 fix.
+    disableSessionStickiness: z.boolean().optional(),
     stickyWeightedLimit: z.coerce.number().int().min(0).max(1000).optional(),
     healthCheckEnabled: z.boolean().optional(),
     healthCheckTimeoutMs: z.coerce.number().int().min(100).max(30000).optional(),
@@ -194,6 +229,23 @@ export const comboRuntimeConfigSchema = z
         minPanel: z.coerce.number().int().min(1).max(50).optional(),
         stragglerGraceMs: z.coerce.number().int().min(0).max(120_000).optional(),
         panelHardTimeoutMs: z.coerce.number().int().min(1000).max(600_000).optional(),
+        // Hard cap on panel size (issue #1905) — see FUSION_DEFAULTS.maxPanel in
+        // open-sse/services/fusion.ts. Bounds how many models can be fanned out
+        // and buffered in memory concurrently before the container's heap ceiling
+        // is at risk.
+        maxPanel: z.coerce.number().int().min(1).max(200).optional(),
+      })
+      .strict()
+      .optional(),
+    // Context window requirements for combo target filtering and sorting.
+    // minContextWindow: filters out models with context windows below this threshold.
+    // preferLargeContext: sorts remaining targets by context size (descending).
+    // contextFilterMode: "strict" excludes unknown-context models, "lenient" includes them.
+    contextRequirements: z
+      .object({
+        minContextWindow: z.coerce.number().int().min(0).max(10_000_000).optional(),
+        preferLargeContext: z.boolean().optional(),
+        contextFilterMode: z.enum(["strict", "lenient"]).optional(),
       })
       .strict()
       .optional(),
@@ -236,7 +288,8 @@ export const createComboSchema = z.object({
   models: z.array(comboModelEntry).optional().default([]),
   strategy: comboStrategySchema.optional().default("priority"),
   config: comboRuntimeConfigSchema.optional(),
-  allowedProviders: z.array(z.string().max(200)).optional(),
+  allowedProviders: z.array(z.string().trim().min(1).max(200)).max(100).optional(),
+  allowedModelFamilies: z.array(z.string().trim().min(1).max(100)).max(100).optional(),
   system_message: z.string().max(50000).optional(),
   tool_filter_regex: z.string().max(1000).optional(),
   context_cache_protection: z.boolean().optional(),
@@ -246,7 +299,11 @@ export const createComboSchema = z.object({
   // the `dimensions` field (and translated to `outputDimensionality` for Gemini).
   // Stored as a string to match the OpenAI API convention; coerced to number
   // by the embedding handler. Leave unset to use each model's default.
-  dimensions: z.string().regex(/^\d+$/, "dimensions must be a positive integer string").optional().nullable(),
+  dimensions: z
+    .string()
+    .regex(/^\d+$/, "dimensions must be a positive integer string")
+    .optional()
+    .nullable(),
 });
 
 export const updateComboDefaultsSchema = z
@@ -290,13 +347,18 @@ export const updateComboSchema = z
     strategy: comboStrategySchema.optional(),
     config: comboRuntimeConfigSchema.optional(),
     isActive: z.boolean().optional(),
-    allowedProviders: z.array(z.string().max(200)).optional(),
+    allowedProviders: z.array(z.string().trim().min(1).max(200)).max(100).optional(),
+    allowedModelFamilies: z.array(z.string().trim().min(1).max(100)).max(100).optional(),
     system_message: z.string().max(50000).optional(),
     tool_filter_regex: z.string().max(1000).optional(),
     context_cache_protection: z.boolean().optional(),
     context_length: z.number().int().min(1000).max(2000000).optional().nullable(),
     compressionOverride: comboCompressionOverrideSchema.optional(),
-    dimensions: z.string().regex(/^\d+$/, "dimensions must be a positive integer string").optional().nullable(),
+    dimensions: z
+      .string()
+      .regex(/^\d+$/, "dimensions must be a positive integer string")
+      .optional()
+      .nullable(),
   })
   .superRefine((value, ctx) => {
     if (
@@ -307,6 +369,7 @@ export const updateComboSchema = z
       value.config === undefined &&
       value.isActive === undefined &&
       value.allowedProviders === undefined &&
+      value.allowedModelFamilies === undefined &&
       value.system_message === undefined &&
       value.tool_filter_regex === undefined &&
       value.context_cache_protection === undefined &&

@@ -1,9 +1,38 @@
 import nextVitals from "eslint-config-next/core-web-vitals";
 import tseslint from "typescript-eslint";
 
+// #7879: bar NEW local `toNumber` definitions outside the canonical helper.
+// Pre-existing definitions (~51 across the codebase) are frozen via
+// config/quality/eslint-suppressions.json and migrated tier-by-tier; only a
+// genuinely NEW `function toNumber`/`const toNumber = ...` should fail.
+const TO_NUMBER_RESTRICTION = {
+  selector: "FunctionDeclaration[id.name='toNumber'], VariableDeclarator[id.name='toNumber']",
+  message:
+    "New local `toNumber` definitions are barred — import `toNumber` from " +
+    "`@/shared/utils/numeric` instead (#7879). See that module's JSDoc for the " +
+    "canonical coercion shape and the `toNumberOrNull`/`toNumberArray` variants.",
+};
+
 /** @type {import("eslint").Linter.Config[]} */
 const eslintConfig = [
   ...nextVitals,
+  // Pacote 4 (plano mestre testes+CI, 2026-07-04) — zero-warning policy: TODA regra roda
+  // como "error" e a dívida pré-existente vive congelada por arquivo+regra em
+  // config/quality/eslint-suppressions.json (ESLint bulk suppressions nativo). Violação
+  // NOVA = vermelho no ato (lint-staged no pre-commit + job lint-guard no fast path);
+  // o drift de +41/+88 warnings/ciclo que era rebaselinado às cegas na release morre no
+  // PR que o introduz. Aperto do baseline: npx eslint . --prune-suppressions
+  // --suppressions-location config/quality/eslint-suppressions.json (na release).
+  {
+    // Escopo = onde os presets do next registram estes plugins (bloco global sem `files`
+    // atingiria scripts/*.mjs sem o plugin react-hooks e explodiria o flat config).
+    files: ["src/**/*.{ts,tsx,js,jsx}"],
+    rules: {
+      "react-hooks/exhaustive-deps": "error",
+      "@next/next/no-img-element": "error",
+      "import/no-anonymous-default-export": "error",
+    },
+  },
   // FASE-02: Security rules (strict everywhere)
   {
     rules: {
@@ -32,14 +61,33 @@ const eslintConfig = [
     files: ["src/app/**/*.{ts,tsx}", "src/components/**/*.{ts,tsx}"],
     rules: {
       "no-restricted-syntax": [
-        "warn",
+        "error",
         {
           selector:
             "CallExpression[callee.property.name='includes'][callee.object.callee.property.name='toLowerCase']",
           message:
             "Türkçe-güvenli arama için matchesSearch() kullan (@/shared/utils/turkishText). Ham toLowerCase().includes() İ/ı karakterlerini bozar.",
         },
+        TO_NUMBER_RESTRICTION,
       ],
+    },
+  },
+  // #7879: same toNumber restriction for the rest of src/ and open-sse/ — kept
+  // as a separate block (via `ignores`) so it does not clobber the
+  // app/components-scoped rule array above (flat config replaces a rule's
+  // options entirely per matching file, it does not merge arrays).
+  {
+    files: ["src/**/*.ts", "open-sse/**/*.ts"],
+    ignores: ["src/app/**", "src/components/**"],
+    rules: {
+      "no-restricted-syntax": ["error", TO_NUMBER_RESTRICTION],
+    },
+  },
+  // Canonical helper module itself is exempt from its own restriction.
+  {
+    files: ["src/shared/utils/numeric.ts"],
+    rules: {
+      "no-restricted-syntax": "off",
     },
   },
   // Relaxed rules for open-sse and tests (incremental adoption)
@@ -49,7 +97,7 @@ const eslintConfig = [
       "@typescript-eslint": tseslint.plugin,
     },
     rules: {
-      "@typescript-eslint/no-explicit-any": "warn",
+      "@typescript-eslint/no-explicit-any": "error",
       "@next/next/no-assign-module-variable": "off",
       "react-hooks/rules-of-hooks": "off",
     },

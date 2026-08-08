@@ -15,7 +15,9 @@ export const ROUTING_STRATEGY_VALUES = [
   "auto",
   "lkgp",
   "context-optimized",
+  "cache-optimized",
   "fusion",
+  "pipeline",
 ] as const;
 
 export type RoutingStrategyValue = (typeof ROUTING_STRATEGY_VALUES)[number];
@@ -197,11 +199,25 @@ export const ROUTING_STRATEGIES: RoutingStrategyOption[] = [
     icon: "text_snippet",
   },
   {
+    value: "cache-optimized",
+    labelKey: "cacheOpt",
+    combosDescKey: "cacheOptimizedDesc",
+    settingsDescKey: "cacheOptDesc",
+    icon: "cached",
+  },
+  {
     value: "fusion",
     labelKey: "fusion",
     combosDescKey: "fusionDesc",
     settingsDescKey: "fusionDesc",
     icon: "hub",
+  },
+  {
+    value: "pipeline",
+    labelKey: "pipeline",
+    combosDescKey: "pipelineDesc",
+    settingsDescKey: "pipelineDesc",
+    icon: "linear_scale",
   },
 ];
 

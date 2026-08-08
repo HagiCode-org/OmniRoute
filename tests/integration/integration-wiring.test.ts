@@ -91,7 +91,7 @@ describe("Pipeline Wiring — instrumentation-node.ts", () => {
     // or it never runs in production. initArenaEloSync self-gates through the feature flag
     // resolver so ARENA_ELO_SYNC_ENABLED and dashboard overrides still apply.
     assert.match(src, /initArenaEloSync/);
-    assert.match(src, /const started = await initArenaEloSync\(\)/);
+    assert.match(src, /m\.initArenaEloSync\(\)/);
   });
 
   it("should initialize pricing + models.dev sync on the live startup path (self-gated, opt-in)", () => {
@@ -602,18 +602,15 @@ describe("Page Integration — provider test results privacy", () => {
   });
 });
 
-describe("Page Integration — legacy provider create route retirement", () => {
-  const legacyProviderNewSrc = readProjectFile(
-    "src/app/(dashboard)/dashboard/providers/new/page.tsx"
-  );
+describe("Page Integration — provider create route renders the onboarding wizard (#5427)", () => {
+  const providerNewSrc = readProjectFile("src/app/(dashboard)/dashboard/providers/new/page.tsx");
 
-  it("should redirect legacy /dashboard/providers/new to the canonical providers flow", () => {
-    assert.ok(
-      legacyProviderNewSrc,
-      "src/app/(dashboard)/dashboard/providers/new/page.tsx should exist"
-    );
-    assert.match(legacyProviderNewSrc, /redirect\("\/dashboard\/providers"\)/);
-    assert.doesNotMatch(legacyProviderNewSrc, /authMethod:\s*"api_key"/);
-    assert.doesNotMatch(legacyProviderNewSrc, /displayName/);
+  it("renders ProviderOnboardingWizard instead of redirecting (#5427)", () => {
+    // #5427 reversed the earlier redirect-stub retirement: /dashboard/providers/new now
+    // renders the previously-orphaned ProviderOnboardingWizard directly (auth enforced by
+    // the (dashboard) layout). The dedicated guard is tests/unit/onboarding-wizard-route-5427.
+    assert.ok(providerNewSrc, "src/app/(dashboard)/dashboard/providers/new/page.tsx should exist");
+    assert.match(providerNewSrc, /ProviderOnboardingWizard/);
+    assert.doesNotMatch(providerNewSrc, /redirect\("\/dashboard\/providers"\)/);
   });
 });

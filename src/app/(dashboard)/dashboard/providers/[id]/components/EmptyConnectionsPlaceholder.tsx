@@ -55,16 +55,21 @@ export default function EmptyConnectionsPlaceholder({
       <p className="text-sm text-text-muted mb-4">{t("addFirstConnectionHint")}</p>
       {!isCompatible && (
         <div className="flex items-center justify-center gap-2">
-          {isCommandCode ? (
+          {isCommandCode || providerId === "clinepass" ? (
             <>
               <Button
                 icon="open_in_new"
                 loading={
-                  commandCodeAuthState.phase === "starting" ||
-                  commandCodeAuthState.phase === "polling" ||
-                  commandCodeAuthState.phase === "applying"
+                  isCommandCode &&
+                  (commandCodeAuthState.phase === "starting" ||
+                    commandCodeAuthState.phase === "polling" ||
+                    commandCodeAuthState.phase === "applying")
                 }
-                onClick={() => gateConnectionFlow(handleOpenCommandCodeConnect)}
+                onClick={() =>
+                  gateConnectionFlow(
+                    isCommandCode ? handleOpenCommandCodeConnect : openPrimaryAddFlow
+                  )
+                }
               >
                 Connect
               </Button>
@@ -105,17 +110,6 @@ export default function EmptyConnectionsPlaceholder({
                 >
                   {typeof t.has === "function" && t.has("importClaudeAuth")
                     ? t("importClaudeAuth")
-                    : "Import auth"}
-                </Button>
-              )}
-              {providerId === "gemini-cli" && (
-                <Button
-                  variant="secondary"
-                  icon="upload_file"
-                  onClick={() => gateConnectionFlow(onOpenImportGemini)}
-                >
-                  {typeof t.has === "function" && t.has("importGeminiAuth")
-                    ? t("importGeminiAuth")
                     : "Import auth"}
                 </Button>
               )}

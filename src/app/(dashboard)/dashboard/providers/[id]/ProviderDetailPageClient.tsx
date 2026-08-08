@@ -9,6 +9,7 @@ import { Card, Button, CardSkeleton } from "@/shared/components";
 import {
   NOAUTH_PROVIDERS,
   getProviderAlias,
+  getProviderById,
   isOpenAICompatibleProvider,
   isAnthropicCompatibleProvider,
   isClaudeCodeCompatibleProvider,
@@ -19,6 +20,9 @@ import {
   compatibleProviderSupportsModelImport,
   getCompatibleFallbackModels,
 } from "@/lib/providers/managedAvailableModels";
+import { getProviderServiceKinds } from "@/lib/providers/serviceKindIndex";
+import { providerLacksModelListing } from "@/lib/providers/modelListingCapability";
+import { providerUsesCuratedModelsOnly } from "@/lib/providers/modelListingCapability";
 import { normalizeModelCatalogSource } from "@/shared/utils/modelCatalogSearch";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import useEmailPrivacyStore from "@/store/emailPrivacyStore";
@@ -37,11 +41,13 @@ import { useModelVisibilityHandlers } from "./hooks/useModelVisibilityHandlers";
 import { useModelCompatState } from "./hooks/useModelCompatState";
 import { useConnectionGate } from "./hooks/useConnectionGate";
 import { useProviderNodeActions } from "./hooks/useProviderNodeActions";
-import ProviderPlaygroundPanel from "./components/ProviderPlaygroundPanel";
+import ProviderExtraPanels from "./components/ProviderExtraPanels";
 import ProviderModelsSection from "./components/ProviderModelsSection";
 import CustomModelsSection from "./components/CustomModelsSection";
 import ConnectionsListPanel from "./components/ConnectionsListPanel";
+import CoolingConnectionsPanel from "./components/CoolingConnectionsPanel";
 import ConnectionsHeaderToolbar from "./components/ConnectionsHeaderToolbar";
+import ProviderAccountRoutingCard from "../../settings/components/ProviderAccountRoutingCard";
 import ZedImportCard from "./components/ZedImportCard";
 import ProviderPageHeader from "./components/ProviderPageHeader";
 import CompatibleNodeCard from "./components/CompatibleNodeCard";
@@ -59,6 +65,7 @@ export default function ProviderDetailPageClient() {
   // ── UI-only modal state (not owned by hooks) ─────────────────────────────
   const [showOAuthModal, _setShowOAuthModal] = useState(false);
   const [reauthConnection, setReauthConnection] = useState<ConnectionRowConnection | null>(null);
+  const [showKimiAuthMethodModal, setShowKimiAuthMethodModal] = useState(false);
   const [showAddApiKeyModal, setShowAddApiKeyModal] = useState(false);
   const [showSiliconFlowEndpointModal, setShowSiliconFlowEndpointModal] = useState(false);
   const [siliconFlowInitialBaseUrl, setSiliconFlowInitialBaseUrl] = useState<string | undefined>();
@@ -79,9 +86,15 @@ export default function ProviderDetailPageClient() {
     isAnthropicCompatibleProvider(providerId) && !isClaudeCodeCompatibleProvider(providerId);
   const isCompatible = isOpenAICompatible || isAnthropicCompatible || isCcCompatible;
   const isAnthropicProtocolCompatible = isAnthropicCompatible || isCcCompatible;
-  const isSearchProvider = providerId.endsWith("-search");
-
-  // ── Phase 1f hooks ────────────────────────────────────────────────────────
+  // #5420: hide model listing for tool-only providers, not just `-search` ids.
+  const declaredServiceKinds = (
+    resolveDashboardProviderInfo(providerId) as { serviceKinds?: readonly string[] } | null
+  )?.serviceKinds;
+  const isSearchProvider = providerLacksModelListing(
+    providerId,
+    getProviderServiceKinds(providerId, declaredServiceKinds)
+  );
+  const usesCuratedModelsOnly = providerUsesCuratedModelsOnly(providerId);
   const {
     connections,
     providerNode,
@@ -96,6 +109,7 @@ export default function ProviderDetailPageClient() {
     batchDeleteConfirmOpen,
     healthFilter,
     page,
+    accountSearch,
     distributingProxies,
     proxyConfig,
     connProxyMap,
@@ -103,15 +117,17 @@ export default function ProviderDetailPageClient() {
     refreshingId,
     setPage,
     setHealthFilter,
+    setAccountSearch,
     setSelectedIds,
     setBatchDeleteConfirmOpen,
     setBatchTestResults,
     setProviderNode,
     fetchConnections,
     fetchProxyConfig,
-    handleDelete,
+    deleteConfirm,
     handleUpdateConnectionStatus,
     handleToggleRateLimit,
+    handleToggleQuotaVisibility,
     handleToggleClaudeExtraUsage,
     handleToggleCodexLimit,
     handleToggleCliproxyapiMode,
@@ -120,6 +136,8 @@ export default function ProviderDetailPageClient() {
     handleRetestConnection,
     handleRefreshToken,
     handleSwapPriority,
+    handleReorderByAvailability,
+    reorderingByAvailability,
     handleBatchSetActive,
     handleBatchDeleteOpenModal,
     handleBatchDeleteConfirm,
@@ -205,13 +223,13 @@ export default function ProviderDetailPageClient() {
   const providerSupportsPat = supportsApiKeyOnFreeProvider(providerId);
   const isOAuth = providerSupportsOAuth && !providerSupportsPat;
   const providerAlias = getProviderAlias(providerId);
-  const isFreeNoAuth = NOAUTH_PROVIDERS[providerId]?.noAuth === true;
+  const isFreeNoAuth =
+    NOAUTH_PROVIDERS[providerId]?.noAuth === true ||
+    getProviderById(providerId)?.managedAccount === true;
   const registryModels = getModelsByProviderId(providerId);
   // Prefer synced API-discovered models when available, then merge built-ins
   // and user-managed custom models without duplicating IDs.
   const models = useMemo(() => {
-    // Universal: merge built-in registry models with API-synced models and
-    // user-managed custom models for ALL providers (was previously Gemini-only).
     // Synced models keep their full property spread so provider-specific fields
     // (e.g. Gemini's `supportedGenerationMethods`) survive into the table.
     const builtInModels = registryModels.map((model) => ({
@@ -220,7 +238,7 @@ export default function ProviderDetailPageClient() {
     }));
 
     const registryIds = new Set(builtInModels.map((m) => m.id));
-    const syncedExtras = syncedAvailableModels
+    const syncedExtras = (usesCuratedModelsOnly ? [] : syncedAvailableModels)
       .filter((model: any) => model?.id && !registryIds.has(model.id))
       .map((model: any) => ({
         ...model,
@@ -229,7 +247,7 @@ export default function ProviderDetailPageClient() {
         source: "imported",
       }));
     const knownIds = new Set([...registryIds, ...syncedExtras.map((model: any) => model.id)]);
-    const customExtras = modelMeta.customModels
+    const customExtras = (usesCuratedModelsOnly ? [] : modelMeta.customModels)
       .filter((cm: any) => cm.id && !knownIds.has(cm.id))
       .map((cm: any) => ({
         id: cm.id,
@@ -242,16 +260,13 @@ export default function ProviderDetailPageClient() {
       if (m.id && !deduped.has(m.id)) deduped.set(m.id, m);
     }
     return Array.from(deduped.values());
-  }, [providerId, registryModels, syncedAvailableModels, modelMeta.customModels]);
-  const isManagedAvailableModelsProvider = isCompatible || providerId === "openrouter";
-  // isSearchProvider declared earlier (before hooks)
+  }, [registryModels, syncedAvailableModels, modelMeta.customModels, usesCuratedModelsOnly]);
   const isUpstreamProxyProvider = providerInfo?.category === "upstream-proxy";
   const compatibleSupportsModelImport = compatibleProviderSupportsModelImport(providerId);
 
   const providerStorageAlias = isCompatible ? providerId : providerAlias;
   const providerDisplayAlias = isCompatible ? providerNode?.prefix || providerId : providerAlias;
 
-  // ── Phase 1k: model import handlers ─────────────────────────────────────
   const {
     importingModels,
     showImportModal,
@@ -301,14 +316,14 @@ export default function ProviderDetailPageClient() {
   }, [providerId]);
 
   const openPrimaryAddFlow = useCallback(() => {
+    if (providerId === "kimi-coding") return setShowKimiAuthMethodModal(true);
     if (isOAuth) {
       setShowOAuthModal(true);
       return;
     }
     openApiKeyAddFlow();
-  }, [isOAuth, openApiKeyAddFlow]);
+  }, [providerId, isOAuth, openApiKeyAddFlow]);
 
-  // ── Phase 1h: commandCode auth flow ─────────────────────────────────────
   const {
     commandCodeAuthState,
     handleCloseAddApiKeyModal,
@@ -360,12 +375,6 @@ export default function ProviderDetailPageClient() {
     exportingClaudeAuthId,
     handleApplyClaudeAuthLocal,
     handleExportClaudeAuthFile,
-    applyingGeminiAuthId,
-    applyGeminiModalConnectionId,
-    setApplyGeminiModalConnectionId,
-    exportingGeminiAuthId,
-    handleApplyGeminiAuthLocal,
-    handleExportGeminiAuthFile,
   } = useAuthFileHandlers({ parseApiErrorMessage, getAttachmentFilename, notify, t });
 
   // Phase 1e: compat-state derivations
@@ -418,8 +427,6 @@ export default function ProviderDetailPageClient() {
     providerNode,
   });
 
-  // renderModelsSection → components/ProviderModelsSection.tsx (Phase 1m)
-
   if (loading) {
     return (
       <div className="flex flex-col gap-8">
@@ -442,7 +449,6 @@ export default function ProviderDetailPageClient() {
 
   return (
     <div className="flex flex-col gap-8">
-      {/* Header — Phase 1t.1: extracted to components/ProviderPageHeader.tsx */}
       <ProviderPageHeader
         providerId={providerId}
         providerInfo={providerInfo}
@@ -456,8 +462,6 @@ export default function ProviderDetailPageClient() {
       {providerId === "zed" && (
         <ZedImportCard fetchConnections={fetchConnections} notify={notify} />
       )}
-
-      {/* CompatibleNodeCard — Phase 1t.2: extracted to components/CompatibleNodeCard.tsx */}
       {isCompatible && providerNode && (
         <CompatibleNodeCard
           providerId={providerId}
@@ -471,16 +475,26 @@ export default function ProviderDetailPageClient() {
           t={t}
         />
       )}
-
-      {/* Connections */}
       {!isUpstreamProxyProvider && isFreeNoAuth && (
         <NoAuthProviderControls
           providerId={providerId}
           providerName={providerInfo?.name || providerId}
+          providerProxy={proxyConfig?.providers?.[providerId]}
+          onConfigureProviderProxy={() =>
+            setProxyTarget({
+              level: "provider",
+              id: providerId,
+              label: providerInfo?.name || providerId,
+            })
+          }
         />
       )}
       {!isUpstreamProxyProvider && !isFreeNoAuth && (
         <Card>
+          <ProviderAccountRoutingCard
+            providerKey={providerId}
+            connectionCount={connections.length}
+          />
           <ConnectionsHeaderToolbar
             providerId={providerId}
             providerInfo={providerInfo}
@@ -494,6 +508,8 @@ export default function ProviderDetailPageClient() {
             retestingId={retestingId}
             distributingProxies={distributingProxies}
             proxyConfig={proxyConfig}
+            reorderingByAvailability={reorderingByAvailability}
+            handleReorderByAvailability={handleReorderByAvailability}
             preferClaudeCodeForUnprefixedClaudeModels={preferClaudeCodeForUnprefixedClaudeModels}
             claudeRoutingSettingsLoaded={claudeRoutingSettingsLoaded}
             claudeRoutingSettingsLoadError={claudeRoutingSettingsLoadError}
@@ -545,68 +561,70 @@ export default function ProviderDetailPageClient() {
               t={t}
             />
           ) : (
-            <ConnectionsListPanel
-              connections={connections}
-              providerId={providerId}
-              isCcCompatible={isCcCompatible}
-              isOAuth={isOAuth}
-              codexGlobalServiceMode={codexGlobalServiceMode}
-              selectedIds={selectedIds}
-              batchUpdating={batchUpdating}
-              batchRetesting={batchRetesting}
-              batchDeleting={batchDeleting}
-              batchTesting={batchTesting}
-              retestingId={retestingId}
-              refreshingId={refreshingId}
-              distributingProxies={distributingProxies}
-              healthFilter={healthFilter}
-              page={page}
-              PAGE_SIZE={PAGE_SIZE}
-              connProxyMap={connProxyMap}
-              proxyConfig={proxyConfig}
-              applyingCodexAuthId={applyingCodexAuthId}
-              exportingCodexAuthId={exportingCodexAuthId}
-              applyingClaudeAuthId={applyingClaudeAuthId}
-              exportingClaudeAuthId={exportingClaudeAuthId}
-              applyingGeminiAuthId={applyingGeminiAuthId}
-              exportingGeminiAuthId={exportingGeminiAuthId}
-              emailsVisible={emailsVisible}
-              setSelectedIds={setSelectedIds}
-              setPage={setPage}
-              setHealthFilter={setHealthFilter}
-              handleDelete={handleDelete}
-              handleUpdateConnectionStatus={handleUpdateConnectionStatus}
-              handleToggleRateLimit={handleToggleRateLimit}
-              handleToggleClaudeExtraUsage={handleToggleClaudeExtraUsage}
-              handleToggleCliproxyapiMode={handleToggleCliproxyapiMode}
-              handleToggleCodexLimit={handleToggleCodexLimit}
-              handleToggleProxyEnabled={handleToggleProxyEnabled}
-              handleTogglePerKeyProxyEnabled={handleTogglePerKeyProxyEnabled}
-              handleRetestConnection={handleRetestConnection}
-              handleRefreshToken={handleRefreshToken}
-              handleSwapPriority={handleSwapPriority}
-              handleBatchSetActive={handleBatchSetActive}
-              handleBatchDeleteOpenModal={handleBatchDeleteOpenModal}
-              handleBatchRetest={handleBatchRetest}
-              handleToggleSelectOne={handleToggleSelectOne}
-              handleToggleSelectAll={handleToggleSelectAll}
-              handleDistributeProxies={handleDistributeProxies}
-              cpaProviderEnabled={cpaProviderEnabled}
-              onOpenEditModal={(conn) => {
-                setSelectedConnection(conn);
-                setShowEditModal(true);
-              }}
-              onOpenOAuth={(conn) => gateConnectionFlow(() => setShowOAuthModal(true, conn))}
-              onSetProxyTarget={setProxyTarget}
-              onOpenApplyCodexModal={setApplyCodexModalConnectionId}
-              onExportCodexAuthFile={handleExportCodexAuthFile}
-              onOpenApplyClaudeModal={setApplyClaudeModalConnectionId}
-              onExportClaudeAuthFile={handleExportClaudeAuthFile}
-              onOpenApplyGeminiModal={setApplyGeminiModalConnectionId}
-              onExportGeminiAuthFile={handleExportGeminiAuthFile}
-              gateConnectionFlow={gateConnectionFlow}
-              t={t}
-            />
+            <>
+              <CoolingConnectionsPanel connections={connections} />
+              <ConnectionsListPanel
+                connections={connections}
+                providerId={providerId}
+                isCcCompatible={isCcCompatible}
+                isOAuth={isOAuth}
+                codexGlobalServiceMode={codexGlobalServiceMode}
+                selectedIds={selectedIds}
+                batchUpdating={batchUpdating}
+                batchRetesting={batchRetesting}
+                batchDeleting={batchDeleting}
+                batchTesting={batchTesting}
+                retestingId={retestingId}
+                refreshingId={refreshingId}
+                distributingProxies={distributingProxies}
+                healthFilter={healthFilter}
+                page={page}
+                accountSearch={accountSearch}
+                PAGE_SIZE={PAGE_SIZE}
+                connProxyMap={connProxyMap}
+                proxyConfig={proxyConfig}
+                applyingCodexAuthId={applyingCodexAuthId}
+                exportingCodexAuthId={exportingCodexAuthId}
+                applyingClaudeAuthId={applyingClaudeAuthId}
+                exportingClaudeAuthId={exportingClaudeAuthId}
+                emailsVisible={emailsVisible}
+                setSelectedIds={setSelectedIds}
+                setPage={setPage}
+                setHealthFilter={setHealthFilter}
+                setAccountSearch={setAccountSearch}
+                deleteConfirm={deleteConfirm}
+                handleUpdateConnectionStatus={handleUpdateConnectionStatus}
+                handleToggleRateLimit={handleToggleRateLimit}
+                handleToggleQuotaVisibility={handleToggleQuotaVisibility}
+                handleToggleClaudeExtraUsage={handleToggleClaudeExtraUsage}
+                handleToggleCliproxyapiMode={handleToggleCliproxyapiMode}
+                handleToggleCodexLimit={handleToggleCodexLimit}
+                handleToggleProxyEnabled={handleToggleProxyEnabled}
+                handleTogglePerKeyProxyEnabled={handleTogglePerKeyProxyEnabled}
+                handleRetestConnection={handleRetestConnection}
+                handleRefreshToken={handleRefreshToken}
+                handleSwapPriority={handleSwapPriority}
+                handleBatchSetActive={handleBatchSetActive}
+                handleBatchDeleteOpenModal={handleBatchDeleteOpenModal}
+                handleBatchRetest={handleBatchRetest}
+                handleToggleSelectOne={handleToggleSelectOne}
+                handleToggleSelectAll={handleToggleSelectAll}
+                handleDistributeProxies={handleDistributeProxies}
+                cpaProviderEnabled={cpaProviderEnabled}
+                onOpenEditModal={(conn) => {
+                  setSelectedConnection(conn);
+                  setShowEditModal(true);
+                }}
+                onOpenOAuth={(conn) => gateConnectionFlow(() => setShowOAuthModal(true, conn))}
+                onSetProxyTarget={setProxyTarget}
+                onOpenApplyCodexModal={setApplyCodexModalConnectionId}
+                onExportCodexAuthFile={handleExportCodexAuthFile}
+                onOpenApplyClaudeModal={setApplyClaudeModalConnectionId}
+                onExportClaudeAuthFile={handleExportClaudeAuthFile}
+                gateConnectionFlow={gateConnectionFlow}
+                t={t}
+              />
+            </>
           )}
         </Card>
       )}
@@ -616,7 +634,6 @@ export default function ProviderDetailPageClient() {
       {!isSearchProvider && !isUpstreamProxyProvider && (
         <Card>
           <h2 className="text-lg font-semibold mb-4">{t("availableModels")}</h2>
-          {/* Phase 1m: extracted to components/ProviderModelsSection.tsx */}
           <ProviderModelsSection
             providerId={providerId}
             providerAlias={providerAlias}
@@ -626,8 +643,9 @@ export default function ProviderDetailPageClient() {
             isCcCompatible={isCcCompatible}
             isAnthropicCompatible={isAnthropicCompatible}
             isAnthropicProtocolCompatible={isAnthropicProtocolCompatible}
-            isManagedAvailableModelsProvider={isManagedAvailableModelsProvider}
+            isManagedAvailableModelsProvider={isCompatible || providerId === "openrouter"}
             compatibleSupportsModelImport={compatibleSupportsModelImport}
+            allowModelImport={!usesCuratedModelsOnly}
             models={models}
             modelMeta={modelMeta}
             modelAliases={modelAliases}
@@ -690,10 +708,9 @@ export default function ProviderDetailPageClient() {
       {/* Search provider info */}
       {isSearchProvider && <SearchProviderCard providerId={providerId} t={t} />}
 
-      {/* Playground panel — rendered for providers that declare serviceKinds */}
-      <ProviderPlaygroundPanel providerId={providerId} />
+      {/* Playground + param filters — extracted to components/ProviderExtraPanels.tsx (#6649) */}
+      <ProviderExtraPanels providerId={providerId} />
 
-      {/* Modals — Phase 1t.5: extracted to components/ProviderModalsPanel.tsx */}
       <ProviderModalsPanel
         providerId={providerId}
         providerInfo={providerInfo}
@@ -703,9 +720,12 @@ export default function ProviderDetailPageClient() {
         isCommandCode={isCommandCode}
         isUpstreamProxyProvider={isUpstreamProxyProvider}
         subscriptionRisk={subscriptionRisk}
+        existingConnectionCount={connections.length}
         showRiskNoticeModal={showRiskNoticeModal}
         handleConfirmRiskNotice={handleConfirmRiskNotice}
         handleCancelRiskNotice={handleCancelRiskNotice}
+        showKimiAuthMethodModal={showKimiAuthMethodModal}
+        setShowKimiAuthMethodModal={setShowKimiAuthMethodModal}
         showOAuthModal={showOAuthModal}
         reauthConnection={reauthConnection}
         handleOAuthSuccess={handleOAuthSuccess}
@@ -725,6 +745,7 @@ export default function ProviderDetailPageClient() {
         handleBatchDeleteConfirm={handleBatchDeleteConfirm}
         selectedIds={selectedIds}
         batchDeleting={batchDeleting}
+        deleteConfirm={deleteConfirm}
         applyCodexModalConnectionId={applyCodexModalConnectionId}
         setApplyCodexModalConnectionId={setApplyCodexModalConnectionId}
         applyingCodexAuthId={applyingCodexAuthId}
@@ -756,12 +777,6 @@ export default function ProviderDetailPageClient() {
         handleApplyClaudeAuthLocal={handleApplyClaudeAuthLocal}
         importClaudeModalOpen={importClaudeModalOpen}
         setImportClaudeModalOpen={setImportClaudeModalOpen}
-        applyGeminiModalConnectionId={applyGeminiModalConnectionId}
-        setApplyGeminiModalConnectionId={setApplyGeminiModalConnectionId}
-        applyingGeminiAuthId={applyingGeminiAuthId}
-        handleApplyGeminiAuthLocal={handleApplyGeminiAuthLocal}
-        importGeminiModalOpen={importGeminiModalOpen}
-        setImportGeminiModalOpen={setImportGeminiModalOpen}
         importGrokCliModalOpen={importGrokCliModalOpen}
         setImportGrokCliModalOpen={setImportGrokCliModalOpen}
         batchTestResults={batchTestResults}

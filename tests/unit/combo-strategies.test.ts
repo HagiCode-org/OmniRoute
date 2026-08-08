@@ -213,11 +213,16 @@ test("least-used strategy prefers the model with fewer recorded combo requests",
     models: [busyModel, idleModel],
   });
 
-  recordComboRequest(name, busyModel, {
-    success: true,
-    latencyMs: 10,
-    strategy: "least-used",
-  });
+  // Prime usage through a real handleComboChat call rather than calling
+  // recordComboRequest() directly: least-used sorts by the per-target
+  // executionKey (combo-name + step-id), not by the bare model string
+  // (#7015/#7059 — sortTargetsByUsage keys byTarget[executionKey] so accounts
+  // sharing a modelStr don't collapse into one bucket). Recording without a
+  // `target` falls back to keying by modelStr, which never matches the real
+  // executionKey and made this assertion flaky against the intended fix.
+  // With no prior usage, least-used ties at 0 and keeps combo order, so this
+  // priming call always lands on busyModel (first in the models array).
+  assert.equal(await selectedModelFor(combo, reqBodyTextArray), busyModel);
 
   assert.equal(await selectedModelFor(combo, reqBodyTextArray), idleModel);
 });
@@ -707,4 +712,40 @@ test("reset-aware strategy scores provider-specific weekly windows when availabl
   };
 
   assert.equal(await selectedConnectionFor(combo), soon);
+});
+
+test("priority combo advances to next model when first returns 400 'model not supported'", async () => {
+  const name = `model-not-supported-${randomUUID()}`;
+  const combo = await combosDb.createCombo({
+    name,
+    strategy: "priority",
+    models: ["openai/gpt-4", "openai/gpt-3.5-turbo"],
+  });
+
+  const calls: string[] = [];
+  const response = await handleComboChat({
+    body: reqBodyTextArray,
+    combo,
+    allCombos: [combo],
+    isModelAvailable: undefined,
+    relayOptions: undefined,
+    signal: undefined,
+    settings: {},
+    log: makeLog(),
+    handleSingleModel: async (_body: unknown, modelStr: string) => {
+      calls.push(modelStr);
+      if (modelStr === "openai/gpt-4") {
+        return Response.json(
+          { error: { message: "requested model is not supported" } },
+          { status: 400 }
+        );
+      }
+      return okResponse(modelStr);
+    },
+  });
+
+  assert.equal(response.status, 200, "combo should advance to second model and return 200");
+  assert.equal(calls.length, 2, "combo should have tried both models");
+  assert.equal(calls[0], "openai/gpt-4", "first model should be tried first");
+  assert.equal(calls[1], "openai/gpt-3.5-turbo", "second model should be tried after 400");
 });

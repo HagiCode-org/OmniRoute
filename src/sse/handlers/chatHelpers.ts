@@ -22,10 +22,13 @@ import {
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import {
   runWithProxyContext,
+  runWithAppliedProxyCapture,
   runWithTlsTracking,
   isTlsFingerprintActive,
+  type AppliedProxySink,
 } from "@omniroute/open-sse/utils/proxyFetch.ts";
 import { resolveProxyForConnection } from "@/lib/localDb";
+import { hasBlockingProxyAssignment } from "@/lib/db/proxies";
 import {
   CircuitBreakerOpenError,
   getCircuitBreaker,
@@ -201,10 +204,20 @@ export async function resolveModelOrError(
 
     try {
       const virtualCombo = await createBuiltinAutoCombo(modelStr, suffix);
+      const poolSize = virtualCombo.candidatePool?.length || 0;
       log.info(
         "AUTO",
-        `"auto" provider → built-in virtual combo "${modelStr}" (${virtualCombo.candidatePool?.length || 0} candidates)`
+        `"auto" provider → built-in virtual combo "${modelStr}" (${poolSize} candidates)`
       );
+      // #6458: fail fast instead of leaking a silent 15s upstream timeout when
+      // the category/tier filter (e.g. auto/coding:pro, auto/reasoning) matches
+      // zero connected candidates. An empty virtual combo has no targets to
+      // dispatch to, so downstream combo routing stalls on an empty set.
+      if (poolSize === 0) {
+        const msg = `No connected providers match '${modelStr}'. Connect a provider whose models satisfy this category/tier, or use a different auto combo.`;
+        log.warn("AUTO", msg, { model: modelStr });
+        return { error: errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, msg) };
+      }
       return { combo: virtualCombo, provider: "auto", model: suffix };
     } catch (err) {
       log.warn("CHAT", `Failed to create built-in auto combo "${modelStr}"`, { err });
@@ -363,6 +376,7 @@ export async function executeChatWithBreaker({
   model,
   refreshedCredentials,
   proxyInfo,
+  appliedProxySink,
   log: handlerLog,
   clientRawRequest,
   credentials,
@@ -379,6 +393,9 @@ export async function executeChatWithBreaker({
   cachedSettings,
   skipUpstreamRetry = false,
   trafficType = "production",
+  correlationId = null,
+  modelPinned = false,
+  routingComboId = null,
 }: ExecuteChatWithBreakerOptions): Promise<{ result: any; tlsFingerprintUsed: boolean }> {
   let tlsFingerprintUsed = false;
   const normalizedTrafficType: TrafficType =
@@ -387,81 +404,93 @@ export async function executeChatWithBreaker({
       : "production";
   const isShadowTraffic = normalizedTrafficType === "shadow";
 
+  // #5217: capture the proxy actually applied during execution so the caller can
+  // merge it into proxyInfo before the egress log (executors pinning a per-account
+  // proxy internally otherwise leave the egress log reading "direct").
+  const capture = <T>(fn: () => T): T =>
+    appliedProxySink ? runWithAppliedProxyCapture(appliedProxySink, fn) : fn();
+
   try {
     const chatFn = () =>
-      runWithProxyContext(proxyInfo?.proxy || null, () =>
-        (handleChatCore as any)({
-          body: { ...body, model: `${provider}/${model}` },
-          modelInfo: { provider, model, extendedContext, apiFormat: modelApiFormat },
-          credentials: refreshedCredentials,
-          log: handlerLog,
-          clientRawRequest,
-          connectionId: credentials.connectionId,
-          apiKeyInfo,
-          userAgent,
-          comboName,
-          comboStrategy,
-          isCombo,
-          comboStepId,
-          comboExecutionKey,
-          cachedSettings,
-          skipUpstreamRetry,
-          trafficType: normalizedTrafficType,
-          onCredentialsRefreshed: async (newCreds: any) => {
-            await updateProviderCredentials(credentials.connectionId, {
-              accessToken: newCreds.accessToken,
-              refreshToken: newCreds.refreshToken,
-              expiresIn: newCreds.expiresIn,
-              expiresAt: newCreds.expiresAt,
-              providerSpecificData: newCreds.providerSpecificData,
-              // Cookie/session providers (chatgpt-web) rotate the stored
-              // apiKey blob mid-request — forward it so the DB credential
-              // doesn't go stale after Set-Cookie rotation.
-              apiKey: newCreds.apiKey,
-              testStatus: newCreds.testStatus ?? "active",
-              isActive: newCreds.isActive,
-            });
-          },
-          onRequestSuccess: async () => {
-            if (isShadowTraffic) return;
-            await clearAccountError(credentials.connectionId, credentials);
-          },
-          onStreamFailure: async (failure: any) => {
-            if (isShadowTraffic) return;
-            if (!credentials.connectionId) return;
-            if (
-              Number(failure?.status) === 499 ||
-              failure?.code === "client_disconnected" ||
-              failure?.type === "client_disconnected"
-            ) {
-              return;
-            }
-            // A3 guard: if 401 and connection has extra keys, skip connection-level disable
-            // (key-level failure already recorded in chatCore.ts via T07)
-            // Check extra keys directly from credentials for reliability across restarts
-            const extraKeys =
-              (credentials.providerSpecificData?.extraApiKeys as string[] | undefined) ?? [];
-            const hasExtraKeys =
-              extraKeys.length > 0 || connectionHasExtraKeys(credentials.connectionId);
-            const is401 = Number(failure?.status) === 401;
-            if (is401 && hasExtraKeys) {
-              log.debug(
-                "AUTH",
-                `A3 guard: skipping markAccountUnavailable for 401 with extra keys on ${credentials.connectionId.slice(0, 8)}`
+      capture(() =>
+        runWithProxyContext(proxyInfo?.proxy || null, () =>
+          (handleChatCore as any)({
+            body: { ...body, model: `${provider}/${model}` },
+            modelInfo: { provider, model, extendedContext, apiFormat: modelApiFormat },
+            credentials: refreshedCredentials,
+            log: handlerLog,
+            clientRawRequest,
+            connectionId: credentials.connectionId,
+            apiKeyInfo,
+            userAgent,
+            comboName,
+            comboStrategy,
+            isCombo,
+            comboStepId,
+            comboExecutionKey,
+            cachedSettings,
+            skipUpstreamRetry,
+            trafficType: normalizedTrafficType,
+            correlationId,
+            modelPinned,
+            routingComboId,
+            onCredentialsRefreshed: async (newCreds: any) => {
+              await updateProviderCredentials(credentials.connectionId, {
+                accessToken: newCreds.accessToken,
+                refreshToken: newCreds.refreshToken,
+                expiresIn: newCreds.expiresIn,
+                expiresAt: newCreds.expiresAt,
+                providerSpecificData: newCreds.providerSpecificData,
+                // Cookie/session providers (chatgpt-web) rotate the stored
+                // apiKey blob mid-request — forward it so the DB credential
+                // doesn't go stale after Set-Cookie rotation.
+                apiKey: newCreds.apiKey,
+                testStatus: newCreds.testStatus ?? "active",
+                isActive: newCreds.isActive,
+              });
+            },
+            onRequestSuccess: async () => {
+              if (isShadowTraffic) return;
+              await clearAccountError(credentials.connectionId, credentials);
+            },
+            onStreamFailure: async (failure: any) => {
+              if (isShadowTraffic) return;
+              if (!credentials.connectionId) return;
+              if (
+                Number(failure?.status) === 499 ||
+                failure?.code === "client_disconnected" ||
+                failure?.type === "client_disconnected" ||
+                isLocalStreamLifecycleError(failure?.message ?? failure) // client abort, #4602
+              ) {
+                return;
+              }
+              // A3 guard: if 401 and connection has extra keys, skip connection-level disable
+              // (key-level failure already recorded in chatCore.ts via T07)
+              // Check extra keys directly from credentials for reliability across restarts
+              const extraKeys =
+                (credentials.providerSpecificData?.extraApiKeys as string[] | undefined) ?? [];
+              const hasExtraKeys =
+                extraKeys.length > 0 || connectionHasExtraKeys(credentials.connectionId);
+              const is401 = Number(failure?.status) === 401;
+              if (is401 && hasExtraKeys) {
+                log.debug(
+                  "AUTH",
+                  `A3 guard: skipping markAccountUnavailable for 401 with extra keys on ${credentials.connectionId.slice(0, 8)}`
+                );
+                return;
+              }
+              await markAccountUnavailable(
+                credentials.connectionId,
+                Number(failure?.status || HTTP_STATUS.BAD_GATEWAY),
+                String(failure?.message || failure?.code || "stream failure"),
+                provider,
+                model,
+                providerProfile,
+                { isCombo }
               );
-              return;
-            }
-            await markAccountUnavailable(
-              credentials.connectionId,
-              Number(failure?.status || HTTP_STATUS.BAD_GATEWAY),
-              String(failure?.message || failure?.code || "stream failure"),
-              provider,
-              model,
-              providerProfile,
-              { isCombo }
-            );
-          },
-        })
+            },
+          })
+        )
       );
 
     if (isShadowTraffic) {
@@ -561,6 +590,9 @@ export function handleNoCredentials(
       return modelCooldownResponse({
         model: cooldownModel,
         retryAfter: credentials.retryAfter,
+        retryAfterAt: typeof credentials.retryAfter === "string" ? credentials.retryAfter : null,
+        credentialsCoolingCount:
+          typeof credentials.connectionsCount === "number" ? credentials.connectionsCount : null,
       });
     }
 
@@ -648,11 +680,6 @@ export function shouldRetryStreamEarlyEof(
   return errorCode === "STREAM_EARLY_EOF" && attempt < STREAM_EARLY_EOF_MAX_RETRIES;
 }
 
-/**
- * Proxy-resolution failure policy. Default: fail-closed (rethrow) so a request
- * with an assigned-but-unresolvable proxy never silently egresses on the real IP.
- * Opt back into the legacy DIRECT fallback with PROXY_FAIL_OPEN=true.
- */
 export function decideProxyResolutionFailure(
   err: unknown,
   env: { PROXY_FAIL_OPEN?: string } = process.env
@@ -669,12 +696,54 @@ export function decideProxyResolutionFailure(
   throw err instanceof Error ? err : new Error(String(err));
 }
 
-export async function safeResolveProxy(connectionId: string, apiKeyId?: string) {
+export async function safeResolveProxy(
+  connectionId: string,
+  apiKeyId?: string,
+  providerId?: string
+) {
   try {
-    return await resolveProxyForConnection(connectionId, apiKeyId);
+    const resolved = await resolveProxyForConnection(connectionId, apiKeyId, providerId);
+    // #6246: a connection that resolves to DIRECT only because its assigned proxy
+    // is dead/inactive must fail closed — egressing on the real IP leaks it. Reuse
+    // the existing proxy-resolution-failure policy (blocks by default; PROXY_FAIL_OPEN
+    // opts back into direct). Explicit "proxy off" is not a leak (see the guard).
+    if (
+      !(resolved as { proxy?: unknown } | null)?.proxy &&
+      hasBlockingProxyAssignment(connectionId, providerId)
+    ) {
+      return decideProxyResolutionFailure(
+        Object.assign(
+          new Error(
+            "PROXY_ASSIGNED_UNAVAILABLE: assigned proxy is inactive/unreachable; refusing to egress on a direct connection"
+          ),
+          { code: "PROXY_ASSIGNED_UNAVAILABLE" }
+        )
+      );
+    }
+    return resolved;
   } catch (proxyErr) {
     return decideProxyResolutionFailure(proxyErr);
   }
+}
+
+/**
+ * #5217: merge a proxy the executor applied internally (captured via
+ * AppliedProxySink) into the pre-execution proxyInfo so the egress logger reflects
+ * the real egress. No applied proxy → proxyInfo unchanged. A pre-existing
+ * non-direct level is preserved; otherwise reported as "account" (per-account
+ * proxy, e.g. OpenCode rotation). Pure + unit-testable.
+ */
+export function applyExecutorProxyToInfo(
+  proxyInfo: { proxy?: unknown; level?: string; levelId?: string | null } | null | undefined,
+  appliedProxy: unknown
+) {
+  if (!appliedProxy) return proxyInfo;
+  const priorLevel = proxyInfo?.level;
+  return {
+    ...(proxyInfo || {}),
+    proxy: appliedProxy,
+    level: priorLevel && priorLevel !== "direct" ? priorLevel : "account",
+  };
 }
 
 // Async because the egress-IP lookup lazy-imports proxyEgress; callers treat
@@ -766,6 +835,23 @@ export function withSessionHeader(response: Response, sessionId: string | null):
       headers: response.headers,
     });
     cloned.headers.set("X-OmniRoute-Session-Id", sessionId);
+    return cloned;
+  }
+}
+
+export function withCorrelationId(response: Response, correlationId: string | null): Response {
+  if (!response || !correlationId) return response;
+
+  try {
+    response.headers.set("X-Correlation-Id", correlationId);
+    return response;
+  } catch {
+    const cloned = new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+    cloned.headers.set("X-Correlation-Id", correlationId);
     return cloned;
   }
 }

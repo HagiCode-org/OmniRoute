@@ -9,7 +9,12 @@ import { useRouter } from "next/navigation";
 import { Card, CardSkeleton, Button, Modal } from "@/shared/components";
 import ProviderIcon from "@/shared/components/ProviderIcon";
 import { AI_PROVIDERS, NOAUTH_PROVIDERS, OAUTH_PROVIDERS } from "@/shared/constants/providers";
+import {
+  isProviderConnectionConnected,
+  isProviderConnectionErrored,
+} from "@/shared/utils/providerConnectionStatus";
 import { useNotificationStore } from "@/store/notificationStore";
+import { extractApiErrorMessage } from "@/shared/http/apiErrorMessage";
 import { copyToClipboard } from "@/shared/utils/clipboard";
 import { getProviderDisplayLabel } from "@/shared/utils/providerDisplayLabel";
 import { useIsElectron, useOpenExternal } from "@/shared/hooks/useElectron";
@@ -99,6 +104,12 @@ function mergeUpdateStep(steps: UpdateStep[], nextStep: UpdateStep) {
   return next;
 }
 
+// Quick-start link classes, extracted so each <Link> still fits on one line with
+// prefetch={false} (#8281) — this file is size-frozen.
+const INLINE_LINK = "text-primary hover:underline";
+const DOCS_LINK =
+  "hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-border text-text-muted hover:text-text-main hover:bg-bg-subtle transition-colors";
+
 export default function HomePageClient({ machineId }: HomePageClientProps) {
   const router = useRouter();
   const isElectron = useIsElectron();
@@ -111,6 +122,7 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
   const [baseUrl, setBaseUrl] = useState("/v1");
   const [selectedProvider, setSelectedProvider] = useState(null);
   const [providerMetrics, setProviderMetrics] = useState<Record<string, ProviderMetricSummary>>({});
+  const [providerTopology, setProviderTopology] = useState({ lastProvider: "", errorProvider: "" });
   const [providerNodes, setProviderNodes] = useState<
     Array<{ id?: string; prefix?: string; name?: string }>
   >([]);
@@ -161,13 +173,7 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
   // Electron internal auto-updater state and listeners
   const [electronUpdateStatus, setElectronUpdateStatus] = useState<{
     status:
-      | "idle"
-      | "checking"
-      | "available"
-      | "not-available"
-      | "downloading"
-      | "downloaded"
-      | "error";
+      "idle" | "checking" | "available" | "not-available" | "downloading" | "downloaded" | "error";
     version?: string;
     percent?: number;
     message?: string;
@@ -309,6 +315,10 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
           const data = await metricsRes.json();
           if (!cancelled) {
             setProviderMetrics(data.metrics || {});
+            setProviderTopology({
+              lastProvider: normalizeProviderId(data.topology?.lastProvider),
+              errorProvider: normalizeProviderId(data.topology?.errorProvider),
+            });
           }
         }
       } catch (error) {
@@ -423,19 +433,11 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
   const providerStats = useMemo(() => {
     return Object.entries(AI_PROVIDERS).map(([providerId, providerInfo]) => {
       const connections = providerConnections.filter((conn) => conn.provider === providerId);
-      const connected = connections.filter(
-        (conn) =>
-          conn.isActive !== false &&
-          (conn.testStatus === "active" ||
-            conn.testStatus === "success" ||
-            conn.testStatus === "unknown")
+      const connected = connections.filter((connection) =>
+        isProviderConnectionConnected(connection)
       ).length;
-      const errors = connections.filter(
-        (conn) =>
-          conn.isActive !== false &&
-          (conn.testStatus === "error" ||
-            conn.testStatus === "expired" ||
-            conn.testStatus === "unavailable")
+      const errors = connections.filter((connection) =>
+        isProviderConnectionErrored(connection)
       ).length;
 
       const providerKeys = new Set([providerId, providerInfo.alias].filter(Boolean));
@@ -468,8 +470,26 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
   }, [selectedProvider, models]);
 
   const topologyProviders = useMemo(() => {
-    const byProvider = new Map<string, { id: string; provider: string; name?: string }>();
+    type ProviderHealth = "active" | "error" | "idle";
+    const byProvider = new Map<
+      string,
+      { id: string; provider: string; name?: string; status: ProviderHealth }
+    >();
     const providerConfig = AI_PROVIDERS as Record<string, { name?: string }>;
+
+    // Connection-health per provider, so the topology node reflects "what is connected"
+    // at rest (green healthy / red error) instead of going blank between requests. A
+    // provider with ≥1 healthy connection is "active"; if none are healthy but some are
+    // errored it is "error"; otherwise "idle". Live/recent traffic still overrides this.
+    const healthByProvider = new Map<string, ProviderHealth>();
+    for (const stat of providerStats) {
+      const canonical = normalizeProviderId(stat.id);
+      if (!canonical) continue;
+      healthByProvider.set(
+        canonical,
+        stat.connected > 0 ? "active" : stat.errors > 0 ? "error" : "idle"
+      );
+    }
 
     const addProvider = (providerId?: string | null, name?: string) => {
       const rawProviderId = typeof providerId === "string" ? providerId.trim() : "";
@@ -488,6 +508,7 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
         id: canonicalProviderId,
         provider: canonicalProviderId,
         name: resolvedName,
+        status: healthByProvider.get(canonicalProviderId) ?? "idle",
       });
     };
 
@@ -499,28 +520,7 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
     return Array.from(byProvider.values());
   }, [providerStats, providerMetrics, providerNodes]);
 
-  const { lastProvider, errorProvider } = useMemo(() => {
-    let recentProvider = "";
-    let recentTimestamp = 0;
-    let recentErrorProvider = "";
-    let recentErrorTimestamp = 0;
-
-    for (const [provider, metrics] of Object.entries(providerMetrics)) {
-      const requestTimestamp = metrics.lastRequestAt ? Date.parse(metrics.lastRequestAt) : 0;
-      if (Number.isFinite(requestTimestamp) && requestTimestamp > recentTimestamp) {
-        recentProvider = normalizeProviderId(provider);
-        recentTimestamp = requestTimestamp;
-      }
-
-      const errorTimestamp = metrics.lastErrorAt ? Date.parse(metrics.lastErrorAt) : 0;
-      if (Number.isFinite(errorTimestamp) && errorTimestamp > recentErrorTimestamp) {
-        recentErrorProvider = normalizeProviderId(provider);
-        recentErrorTimestamp = errorTimestamp;
-      }
-    }
-
-    return { lastProvider: recentProvider, errorProvider: recentErrorProvider };
-  }, [providerMetrics]);
+  const { lastProvider, errorProvider } = providerTopology;
 
   const pollBackgroundUpdate = useCallback(
     async ({
@@ -685,7 +685,11 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
       if (contentType.includes("application/json")) {
         const data = await res.json();
         if (!res.ok || !data.success) {
-          notify.error(data.error || "Failed to start update.");
+          // #5991: the error envelope is `{ error: { code, message, correlation_id } }`.
+          // Passing the raw object to notify.error() rendered it as a React child →
+          // "Minified React error #31" crash ("Internal Server Error" screen), e.g. on
+          // the 403 from the loopback-only /api/system/version. Extract the string.
+          notify.error(extractApiErrorMessage(data, "Failed to start update."));
           setUpdating(false);
           setUpdatePhase("idle");
           return;
@@ -842,7 +846,7 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
                         error
                       </span>
                     ) : (
-                      <span className="material-symbols-outlined text-yellow-500 text-[18px]">
+                      <span className="material-symbols-outlined text-amber-500 text-[18px]">
                         warning
                       </span>
                     )}
@@ -1090,10 +1094,7 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
                 <h2 className="text-lg font-semibold">{t("quickStart")}</h2>
                 <p className="text-sm text-text-muted">{t("quickStartDesc")}</p>
               </div>
-              <Link
-                href="/docs"
-                className="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-border text-text-muted hover:text-text-main hover:bg-bg-subtle transition-colors"
-              >
+              <Link href="/docs" prefetch={false} className={DOCS_LINK}>
                 <span className="material-symbols-outlined text-[14px]">menu_book</span>
                 {t("fullDocs")}
               </Link>
@@ -1109,7 +1110,11 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
                   <p className="text-text-muted mt-0.5">
                     {t.rich("step1Desc", {
                       endpoint: (chunks) => (
-                        <Link href="/dashboard/endpoint" className="text-primary hover:underline">
+                        <Link
+                          href="/dashboard/api-manager"
+                          prefetch={false}
+                          className={INLINE_LINK}
+                        >
                           {chunks}
                         </Link>
                       ),
@@ -1126,7 +1131,7 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
                   <p className="text-text-muted mt-0.5">
                     {t.rich("step2Desc", {
                       providers: (chunks) => (
-                        <Link href="/dashboard/providers" className="text-primary hover:underline">
+                        <Link href="/dashboard/providers" prefetch={false} className={INLINE_LINK}>
                           {chunks}
                         </Link>
                       ),
@@ -1154,12 +1159,12 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
                   <p className="text-text-muted mt-0.5">
                     {t.rich("step4Desc", {
                       logs: (chunks) => (
-                        <Link href="/dashboard/logs" className="text-primary hover:underline">
+                        <Link href="/dashboard/logs" prefetch={false} className={INLINE_LINK}>
                           {chunks}
                         </Link>
                       ),
                       analytics: (chunks) => (
-                        <Link href="/dashboard/analytics" className="text-primary hover:underline">
+                        <Link href="/dashboard/analytics" prefetch={false} className={INLINE_LINK}>
                           {chunks}
                         </Link>
                       ),

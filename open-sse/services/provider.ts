@@ -1,6 +1,7 @@
 // @ts-nocheck
 import { PROVIDERS } from "../config/constants.ts";
 import { getRegistryEntry } from "../config/providerRegistry.ts";
+import { resolveAlternateFormat } from "../config/providers/alternateFormats.ts";
 import {
   buildClaudeCodeCompatibleHeaders,
   CLAUDE_CODE_COMPATIBLE_DEFAULT_CHAT_PATH,
@@ -8,6 +9,7 @@ import {
 } from "./claudeCodeCompatible.ts";
 import { getClaudeCodeCompatibleRequestDefaults } from "@/lib/providers/requestDefaults";
 import { buildClineHeaders } from "@/shared/utils/clineAuth";
+import { usesCcWireImage } from "./ccWireImageBuiltins.ts";
 
 const OPENAI_COMPATIBLE_PREFIX = "openai-compatible-";
 const OPENAI_COMPATIBLE_DEFAULTS = {
@@ -29,7 +31,12 @@ function isAnthropicCompatible(provider) {
 }
 
 export function isClaudeCodeCompatible(provider) {
-  return typeof provider === "string" && provider.startsWith(CLAUDE_CODE_COMPATIBLE_PREFIX);
+  return (
+    (typeof provider === "string" && provider.startsWith(CLAUDE_CODE_COMPATIBLE_PREFIX)) ||
+    // Built-in providers (e.g. agentrouter) that adopt the dynamic CC wire image
+    // while keeping their own registry baseUrl + auth (#6056).
+    usesCcWireImage(provider)
+  );
 }
 
 export function getOpenAICompatibleType(
@@ -123,6 +130,12 @@ export function detectFormatFromEndpoint(body, endpointPath = "") {
   }
 
   return detectFormat(body);
+}
+
+// Thin wrapper for call sites that only have the full request URL (not the bare endpoint
+// path chatCore already threads) — single source of truth stays detectFormatFromEndpoint.
+export function detectFormatFromUrl(body, requestUrl) {
+  return detectFormatFromEndpoint(body, new URL(requestUrl).pathname);
 }
 
 // Detect request format from body structure
@@ -256,6 +269,15 @@ export function buildProviderUrl(
     providerSpecificData?: Record<string, unknown> | null;
   } = {}
 ) {
+  // Built-in CC-wire-image providers (e.g. agentrouter): keep the registry's
+  // OWN baseUrl (NOT the CC family's anthropic default) but adopt the CC chat
+  // path so the request still targets `<registry-baseUrl>?beta=true` (#6056).
+  if (usesCcWireImage(provider)) {
+    const entry = getRegistryEntry(provider);
+    const config = getProviderConfig(provider);
+    const baseUrl = options?.baseUrl || entry?.baseUrl || config.baseUrl;
+    return joinClaudeCodeCompatibleUrl(baseUrl, CLAUDE_CODE_COMPATIBLE_DEFAULT_CHAT_PATH);
+  }
   if (isOpenAICompatible(provider)) {
     const providerSpecificData = options?.providerSpecificData || null;
     const apiType = getOpenAICompatibleType(provider, providerSpecificData);
@@ -285,7 +307,7 @@ export function buildProviderUrl(
       if (entry.urlBuilder) return entry.urlBuilder(baseUrl, model, stream);
       return baseUrl;
     }
-    // Custom URL builder (e.g. gemini, gemini-cli)
+    // Custom URL builder (e.g. gemini, antigravity)
     if (entry.urlBuilder) {
       const baseUrl = entry.baseUrl || config.baseUrl;
       if (baseUrl) {
@@ -318,12 +340,27 @@ export function buildProviderHeaders(provider, credentials, stream = true, body 
     const ccRequestDefaults = getClaudeCodeCompatibleRequestDefaults(
       credentials?.providerSpecificData
     );
-    return buildClaudeCodeCompatibleHeaders(
+    const ccHeaders = buildClaudeCodeCompatibleHeaders(
       token,
       stream,
       credentials?.providerSpecificData?.ccSessionId,
       { redactThinking: ccRequestDefaults.redactThinking === true }
     );
+    // Built-in CC-wire-image providers (e.g. agentrouter): adopt the CC wire
+    // image headers but keep the registry's OWN auth scheme (e.g. x-api-key)
+    // instead of the CC family's Bearer auth (#6056).
+    if (usesCcWireImage(provider)) {
+      delete ccHeaders["Authorization"];
+      const authHeader = entry?.authHeader || "bearer";
+      if (authHeader === "x-api-key") {
+        if (token) ccHeaders["x-api-key"] = token;
+      } else if (authHeader === "key") {
+        if (token) ccHeaders["Authorization"] = `Key ${token}`;
+      } else {
+        ccHeaders["Authorization"] = `Bearer ${token}`;
+      }
+    }
+    return ccHeaders;
   }
   if (isAnthropicCompatible(provider)) {
     if (credentials.apiKey) {
@@ -401,7 +438,13 @@ export function getTargetFormat(provider, providerSpecificData = null) {
   }
   // Registry-driven format lookup
   const entry = getRegistryEntry(provider);
-  if (entry) return entry.format || "openai";
+  if (entry) {
+    // Per-connection override (providerSpecificData.targetFormat), only valid
+    // when it matches an alternate declared by the provider.
+    const alternate = resolveAlternateFormat(entry, providerSpecificData);
+    if (alternate) return alternate.format;
+    return entry.format || "openai";
+  }
   const config = getProviderConfig(provider);
   return config.format || "openai";
 }

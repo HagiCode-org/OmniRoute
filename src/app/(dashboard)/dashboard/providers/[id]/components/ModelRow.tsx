@@ -103,8 +103,8 @@ export function ModelVisibilityToolbar({
   t,
   filterValue,
   onFilterChange,
-  activeCount: _activeCount,
-  totalCount: _totalCount,
+  activeCount,
+  totalCount,
   onSelectAll,
   onDeselectAll,
   selectAllDisabled,
@@ -245,6 +245,12 @@ export function ModelVisibilityToolbar({
         <span className="material-symbols-outlined text-[16px]">visibility_off</span>
         <span>{providerText(t, "hideAllModels", "Hide all")}</span>
       </button>
+      <span className="whitespace-nowrap text-xs text-text-muted">
+        {providerText(t, "modelsActiveCount", "{active}/{total} active", {
+          active: activeCount,
+          total: totalCount,
+        })}
+      </span>
     </div>
   );
 }
@@ -279,6 +285,7 @@ export interface ModelRowProps {
 export default function ModelRow({
   model,
   fullModel,
+  provider,
   alias,
   copied,
   onCopy,
@@ -439,6 +446,8 @@ export default function ModelRow({
         )}
         <ModelCompatPopover
           t={t}
+          providerId={provider}
+          modelId={model.id}
           effectiveModelNormalize={(p) => effectiveModelNormalize(model.id, p)}
           effectiveModelPreserveDeveloper={(p) => effectiveModelPreserveDeveloper(model.id, p)}
           getUpstreamHeadersRecord={getUpstreamHeadersRecord}

@@ -122,6 +122,7 @@ export function synthOpenAIErrorChunk(opts: {
     error: {
       message: safeMessage,
       type: "upstream_empty_response",
+      code: "upstream_empty_response",
     },
   };
   return `data: ${JSON.stringify(body)}\n\n`;
@@ -168,6 +169,9 @@ export function synthResponsesFailure(reason?: MalformedReason): string {
  * - Tool-call responses (content=null + tool_calls=[…]) are also valid.
  * - Responses API function_call / other structural items count as output even
  *   when they carry no user-visible text.
+ * - Claude Messages shape (type:"message" + content[]) is checked directly,
+ *   since a Claude client receives the body in that shape (no
+ *   `choices`/`object:"response"`).
  */
 export function detectMalformedNonStream(resp: unknown): MalformedReason | null {
   if (!resp || typeof resp !== "object") return "empty_choices";
@@ -213,16 +217,25 @@ export function detectMalformedNonStream(resp: unknown): MalformedReason | null 
       // throws on `null.type` (that would crash the whole non-stream classifier).
       if (block === null || typeof block !== "object") return false;
       const b = block as Record<string, unknown>;
-      // Text block with visible text.
-      if (b.type === "text" && typeof b.text === "string" && (b.text as string).length > 0) {
+      // Text block with visible text. `convertOpenAINonStreamingToClaude` emits
+      // "(empty response)" as a placeholder when the upstream produced no content,
+      // so treat that sentinel as empty — a genuinely empty completion still trips
+      // the guard (parity with the OpenAI `content:""` path).
+      if (
+        b.type === "text" &&
+        typeof b.text === "string" &&
+        (b.text as string).length > 0 &&
+        b.text !== "(empty response)"
+      ) {
         return true;
       }
-      // Extended-thinking block: a non-empty `signature` is cryptographic proof the
-      // thinking step ran, so it is a valid completion even when the thinking text is "".
+      // Extended-thinking block: valid when it carries visible thinking text OR a
+      // non-empty `signature` (cryptographic proof the thinking step ran, so it is a
+      // valid completion even when the thinking text is "").
       if (
         b.type === "thinking" &&
-        typeof b.signature === "string" &&
-        (b.signature as string).length > 0
+        ((typeof b.thinking === "string" && (b.thinking as string).length > 0) ||
+          (typeof b.signature === "string" && (b.signature as string).length > 0))
       ) {
         return true;
       }
@@ -244,6 +257,24 @@ export function detectMalformedNonStream(resp: unknown): MalformedReason | null 
     const c = choice as Record<string, unknown>;
     const msg = c?.message as Record<string, unknown> | undefined;
     if (typeof msg?.content === "string" && (msg.content as string).length > 0) return true;
+    // #5559: some OpenAI-compatible upstreams (e.g. Cline via OAuth) return
+    // `message.content` as an array of Anthropic-style content blocks rather than
+    // a plain string. An array with at least one non-empty text block is real
+    // output — without this it was falsely flagged as empty_choices → 502 + cooldown.
+    if (
+      Array.isArray(msg?.content) &&
+      (msg.content as unknown[]).some((block) => {
+        const b = block as Record<string, unknown> | null;
+        return (
+          !!b &&
+          typeof b === "object" &&
+          b.type === "text" &&
+          typeof b.text === "string" &&
+          (b.text as string).length > 0
+        );
+      })
+    )
+      return true;
     if (Array.isArray(msg?.tool_calls) && (msg.tool_calls as unknown[]).length > 0) return true;
     if (typeof msg?.reasoning_content === "string" && (msg.reasoning_content as string).length > 0)
       return true;
@@ -252,6 +283,28 @@ export function detectMalformedNonStream(resp: unknown): MalformedReason | null 
 
   if (!anyHasOutput) return "empty_choices";
   return null;
+}
+
+export function describeMalformedNonStream(
+  resp: unknown,
+  reason: MalformedReason
+): { message: string; code: string; type: string } {
+  const body = resp && typeof resp === "object" ? (resp as Record<string, unknown>) : null;
+  if (body?.object === "response" && body.status === "failed") {
+    return {
+      message: "upstream reported a failed response without usable output",
+      code: "upstream_response_failed",
+      type: "upstream_response_error",
+    };
+  }
+  return {
+    message:
+      reason === "no_terminal"
+        ? "upstream response did not reach a terminal state"
+        : "upstream returned an empty response without usable output",
+    code: "upstream_empty_response",
+    type: "upstream_response_error",
+  };
 }
 
 // ── Test-only export ─────────────────────────────────────────────────────────

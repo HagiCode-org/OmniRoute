@@ -8,21 +8,11 @@ import {
   isBedrockNativeApiError,
   isBedrockNativeAuthError,
 } from "@omniroute/open-sse/services/bedrock.ts";
-import {
-  addModelsSuffix,
-  normalizeBaseUrl,
-  resolveChatUrl,
-} from "./urlHelpers";
-import {
-  applyCustomUserAgent,
-  buildBearerHeaders,
-} from "./headers";
-import {
-  toValidationErrorResult,
-  validationRead,
-  validationWrite,
-} from "./transport";
+import { addModelsSuffix, normalizeBaseUrl, resolveChatUrl } from "./urlHelpers";
+import { applyCustomUserAgent, buildBearerHeaders } from "./headers";
+import { toValidationErrorResult, validationRead, validationWrite } from "./transport";
 import { validateDirectChatProvider } from "./directChatProbe";
+import { extractCozeValidationError } from "./cozeError";
 
 export async function validateBedrockProvider({ apiKey, providerSpecificData = {} }: any) {
   if (!apiKey) {
@@ -64,7 +54,6 @@ export async function validateBedrockProvider({ apiKey, providerSpecificData = {
     return toValidationErrorResult(error);
   }
 }
-
 
 export async function validateOpenAILikeProvider({
   provider = "openai",
@@ -155,6 +144,20 @@ export async function validateOpenAILikeProvider({
       return { valid: true, error: null };
     }
 
+    // #5426: Coze answers the chat probe with a JSON envelope ({ code, msg,
+    // logId, from }) on a bad key. Translate it into a friendly message so the
+    // raw envelope (logId included) never leaks into the connection UI. Scoped
+    // to provider === "coze" so a non-Coze error body that happens to carry a
+    // `msg` field is never mislabeled, and other providers' response bodies are
+    // never consumed here — they fall through to the canned handling below.
+    if (provider === "coze") {
+      const chatErrorBody = await chatRes.text().catch(() => "");
+      const cozeError = extractCozeValidationError(chatErrorBody);
+      if (cozeError) {
+        return { valid: false, error: cozeError };
+      }
+    }
+
     if (chatRes.status === 401 || chatRes.status === 403) {
       return { valid: false, error: "Invalid API key" };
     }
@@ -167,12 +170,24 @@ export async function validateOpenAILikeProvider({
       return { valid: false, error: `Provider unavailable (${chatRes.status})` };
     }
 
+    // #7284: A 429 on the chat probe means the key is accepted but this connection
+    // is rate/concurrency limited (e.g. always-throttled free tiers like opencode-zen).
+    // Keep valid:true (the key works) but surface a warning so the connection Test
+    // does not read as an unqualified green when real traffic will hit 429s.
+    // Mirrors validateBedrockProvider's existing 429 precedent above.
+    if (chatRes.status === 429) {
+      return {
+        valid: true,
+        error: null,
+        warning: "Provider accepted the key but is rate limited (429)",
+      };
+    }
+
     return { valid: true, error: null };
   } catch (error: any) {
     return toValidationErrorResult(error);
   }
 }
-
 
 export async function validateCommandCodeProvider({ apiKey, providerSpecificData = {} }: any) {
   const entry = getRegistryEntry("command-code");
@@ -225,7 +240,6 @@ export async function validateCommandCodeProvider({ apiKey, providerSpecificData
     },
   });
 }
-
 
 // HuggingFace fine-grained Inference-Provider tokens are valid even when
 // model/task endpoints reject them, so the generic OpenAI-like probe against
@@ -282,16 +296,15 @@ export async function validateGeminiLikeProvider({
         : `${baseForModels}/models`;
 
     // Use the correct auth header based on provider config:
-    // - gemini / gemini-cli (API key): x-goog-api-key
-    // - gemini-cli (OAuth): Bearer token
+    // - gemini (API key): x-goog-api-key
+    // - Google OAuth access tokens (ya29.*): Bearer token
     const headers: Record<string, string> = {};
     let urlWithKey = requestUrl;
 
     if (typeof apiKey === "string" && apiKey.startsWith("ya29.")) {
       // A Google OAuth access token (ya29.*) must use Bearer auth even when the
-      // connection is configured as an API-key provider — gemini-cli OAuth stores the
-      // access token in the apiKey field. Checked first so authType "apikey"/"header"
-      // doesn't shadow it with x-goog-api-key.
+      // connection is configured as an API-key provider. Checked first so authType
+      // "apikey"/"header" doesn't shadow it with x-goog-api-key.
       headers["Authorization"] = `Bearer ${apiKey}`;
     } else if (normalizedAuthType === "header" || normalizedAuthType === "apikey") {
       headers["x-goog-api-key"] = apiKey;
@@ -361,7 +374,6 @@ export async function validateGeminiLikeProvider({
 }
 
 // ── Specialty providers (non-standard APIs) ──
-
 
 export async function validateOpenAICompatibleProvider({ apiKey, providerSpecificData = {} }: any) {
   const baseUrl = normalizeBaseUrl(providerSpecificData.baseUrl);
@@ -460,6 +472,31 @@ export async function validateOpenAICompatibleProvider({ apiKey, providerSpecifi
       };
     }
 
+    // #2032: a 404 on the chat probe commonly means the requested model id
+    // does not exist at this provider (OpenAI-compatible `model_not_found`,
+    // e.g. Featherless/OpenRouter-style `vendor/model` typos). Credentials
+    // are still valid (the endpoint responded), but silently passing this
+    // hides the bad model id from the user until a real request later trips
+    // the per-model lockout — surface it as a warning at Check time instead.
+    if (chatRes.status === 404) {
+      let modelNotFoundDetail = "";
+      try {
+        const body: any = await chatRes.json();
+        const err = body?.error;
+        if (typeof err?.message === "string" && err.message.trim()) {
+          modelNotFoundDetail = `: ${err.message.trim()}`;
+        }
+      } catch {
+        // Non-JSON or unreadable body — fall through with the generic warning.
+      }
+      return {
+        valid: true,
+        error: null,
+        method: "inference_available",
+        warning: `Model ID may not exist at this provider (404)${modelNotFoundDetail}`,
+      };
+    }
+
     // 4xx other than auth (e.g. 400 bad model, 422) usually means auth passed
     if (chatRes.status >= 400 && chatRes.status < 500) {
       return {
@@ -499,4 +536,3 @@ export async function validateOpenAICompatibleProvider({ apiKey, providerSpecifi
     return toValidationErrorResult(error);
   }
 }
-

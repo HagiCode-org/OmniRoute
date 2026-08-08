@@ -360,22 +360,26 @@ test("Chat -> Responses converts messages, tool calls, tool outputs, tools and p
         { type: "input_image", image_url: "https://example.com/cat.png", detail: "high" },
         { type: "input_file", file_data: "abc", filename: "doc.txt" },
       ],
+      status: "completed",
     },
     {
       type: "message",
       role: "assistant",
       content: [{ type: "output_text", text: "Done" }],
+      status: "completed",
     },
     {
       type: "function_call",
       call_id: "call_1",
       name: "read_file",
       arguments: '{"path":"/tmp/a"}',
+      status: "completed",
     },
     {
       type: "function_call_output",
       call_id: "call_1",
       output: [{ type: "input_text", text: "ok" }],
+      status: "completed",
     },
   ]);
   assert.deepEqual((result as any).tools, [
@@ -536,6 +540,7 @@ test("Chat -> Responses converts assistant image_url history parts to output_tex
         { type: "output_text", text: "I inspected the screenshot." },
         { type: "output_text", text: "[Image: https://example.com/scope.png]" },
       ],
+      status: "completed",
     },
   ]);
   assert.equal(JSON.stringify(result).includes('"image_url"'), false);
@@ -615,9 +620,32 @@ test("Chat -> Responses maps reasoning_effort into Responses reasoning", () => {
     null
   );
 
-  assert.deepEqual((result as any).reasoning, { effort: "low" });
+  // Effort-only chat requests now default `summary: "auto"` + the encrypted
+  // reasoning include so Responses-API upstreams stream thinking back to the
+  // chat client (previously the summary was empty and no think was visible).
+  assert.deepEqual((result as any).reasoning, { effort: "low", summary: "auto" });
+  assert.deepEqual((result as Record<string, unknown>).include, ["reasoning.encrypted_content"]);
   assert.equal((result as any).reasoning_effort, undefined);
   assert.equal((result as any).store, false);
+});
+
+test("Chat -> Responses does not default a reasoning summary for reasoning_effort none", () => {
+  const result = openaiToOpenAIResponsesRequest(
+    "gpt-5.3-codex-spark",
+    {
+      messages: [{ role: "user", content: "Hello" }],
+      reasoning_effort: "none",
+    },
+    false,
+    null
+  );
+
+  const record = result as Record<string, unknown>;
+  const reasoning = record.reasoning as Record<string, unknown> | undefined;
+  if (reasoning !== undefined) {
+    assert.equal(reasoning.summary, undefined);
+  }
+  assert.equal(record.include, undefined);
 });
 
 test("Chat -> Responses normalizes reasoning_effort max to xhigh", () => {
@@ -631,7 +659,7 @@ test("Chat -> Responses normalizes reasoning_effort max to xhigh", () => {
     null
   );
 
-  assert.deepEqual((result as any).reasoning, { effort: "xhigh" });
+  assert.deepEqual((result as any).reasoning, { effort: "xhigh", summary: "auto" });
   assert.equal((result as any).reasoning_effort, undefined);
 });
 
@@ -903,21 +931,17 @@ test("Responses -> Chat: tool_search does not throw (issue #2766)", () => {
   );
 });
 
-test("Responses -> Chat: tool_search is stripped from output tools array (issue #2766)", () => {
-  // Codex clients send tool_search alongside function tools. tool_search has no
-  // Chat Completions equivalent and must be dropped; function tools must remain.
+test("Responses -> Chat: tool_search is mapped to a Chat function tool, not dropped (#7532)", () => {
+  // tool_search (execution: "client") is client-resolved, same as local_shell -> shell;
+  // dropping it (#2766) hid the tool and broke Codex's deferred tool-discovery on
+  // downgrade (#7532) — it is now mapped to a Chat function tool instead.
   const result = openaiResponsesToOpenAIRequest(
     "gpt-4o",
     {
       input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
       tools: [
         { type: "tool_search", name: "search" },
-        {
-          type: "function",
-          name: "foo",
-          description: "A function",
-          parameters: { type: "object" },
-        },
+        { type: "function", name: "foo", description: "A function", parameters: { type: "object" } },
       ],
     },
     false,
@@ -926,14 +950,12 @@ test("Responses -> Chat: tool_search is stripped from output tools array (issue 
 
   const tools = result.tools as any[];
   assert.ok(Array.isArray(tools), "tools array must be present");
-  assert.equal(
-    tools.some((t) => t.type === "tool_search"),
-    false,
-    "tool_search must be stripped from output"
-  );
-  assert.equal(tools.length, 1, "only the function tool must remain");
-  assert.equal(tools[0].type, "function");
-  assert.equal(tools[0].function.name, "foo");
+  assert.equal(tools.some((t) => t.type === "tool_search"), false, "raw tool_search type must not survive");
+  assert.equal(tools.length, 2, "mapped tool_search function + the function tool must remain");
+  const toolSearch = tools.find((t) => t.function?.name === "search");
+  assert.ok(toolSearch, "tool_search must be mapped to a Chat function tool named after it");
+  assert.equal(toolSearch.type, "function");
+  assert.equal(tools.find((t) => t.function?.name === "foo")?.type, "function");
 });
 
 // --- Issue #2950: image_generation built-in should be silently dropped ---
@@ -989,9 +1011,6 @@ test("Responses -> Chat: image_generation is stripped from output tools array (i
 // --- Codex CLI: local_shell built-in should be mapped to a function tool ---
 
 test("Responses -> Chat: local_shell does not throw", () => {
-  // Recent Codex CLI releases inject local_shell as a Responses API built-in.
-  // Non-OpenAI upstreams do not support this tool type directly, so OmniRoute
-  // must translate it instead of rejecting the request with 400.
   assert.doesNotThrow(() =>
     openaiResponsesToOpenAIRequest(
       "gpt-4o",
@@ -1040,7 +1059,7 @@ test("Responses -> Chat: local_shell tool_choice maps to shell function choice",
   assert.deepEqual(result.tool_choice, { type: "function", function: { name: "shell" } });
 });
 
-test("Chat -> Responses: shell function maps back to local_shell", () => {
+test("Chat -> Responses: shell function stays caller-side and does not leak local_shell", () => {
   const result = openaiToOpenAIResponsesRequest(
     "gpt-4o",
     {
@@ -1061,17 +1080,16 @@ test("Chat -> Responses: shell function maps back to local_shell", () => {
     null
   ) as Record<string, unknown>;
 
-  assert.deepEqual(result.tools, [{ type: "local_shell" }]);
-  assert.deepEqual(result.tool_choice, { type: "local_shell" });
+  assert.equal((result.tools as any[])[0].type, "function");
+  assert.equal((result.tools as any[])[0].name, "shell");
+  assert.equal((result.tools as any[])[0].description, "Run a shell command");
+  assert.deepEqual((result.tools as any[])[0].parameters, { type: "object" });
+  assert.deepEqual(result.tool_choice, { type: "function", name: "shell" });
 });
 
 // --- Issue #2893: orphaned tool results from empty/missing call_id ---
 
 test("Responses -> Chat: function_call with empty call_id is dropped together with its output (issue #2893)", () => {
-  // Codex can emit a function_call without a usable call_id; its
-  // function_call_output then becomes an orphan tool message that the upstream
-  // rejects ("role 'tool' must be a response to a preceding message with
-  // 'tool_calls'"). Both must be dropped.
   const result = openaiResponsesToOpenAIRequest(
     "gpt-4o",
     {
@@ -1086,13 +1104,11 @@ test("Responses -> Chat: function_call with empty call_id is dropped together wi
   ) as Record<string, unknown>;
 
   const messages = result.messages as any[];
-  // No orphan tool message.
   assert.equal(
     messages.some((m) => m.role === "tool"),
     false,
     "tool result with empty tool_call_id must be dropped"
   );
-  // No dangling assistant tool_call with an empty id.
   const danglingEmptyId = messages.some(
     (m) =>
       m.role === "assistant" &&

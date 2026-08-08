@@ -20,9 +20,9 @@ function randomSentinelSeed(): string {
   const cryptoLike = globalThis.crypto;
   if (cryptoLike?.getRandomValues) {
     cryptoLike.getRandomValues(bytes);
-    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    return `r${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
   }
-  return Math.random().toString(36).slice(2);
+  return `r${Math.random().toString(36).slice(2)}`;
 }
 
 function ensureGlobal(pattern: RegExp): RegExp {
@@ -129,6 +129,34 @@ export function extractPreservedBlocks(
     result = replacePattern(result, ensureGlobal(pattern), kind, addBlock);
   }
 
+  return { text: result, blocks };
+}
+
+/**
+ * Wrap explicit literal spans (by offset) into SENTINEL placeholders, reusing
+ * the exact placeholder family that every engine already treats as opaque.
+ * Spans must be non-overlapping and pre-sorted ascending. Restored via
+ * `restorePreservedBlocks`.
+ */
+export function preserveSpans(
+  text: string,
+  spans: Array<{ start: number; end: number; kind: string }>
+): { text: string; blocks: PreservedBlock[] } {
+  if (!spans.length) return { text, blocks: [] };
+  const seed = randomSentinelSeed();
+  const blocks: PreservedBlock[] = [];
+  let result = "";
+  let cursor = 0;
+  let counter = 0;
+  for (const span of spans) {
+    if (span.start < cursor || span.end > text.length || span.start >= span.end) continue;
+    const placeholder = `${SENTINEL_PREFIX}_${seed}_${counter}\u0000`;
+    blocks.push({ placeholder, content: text.slice(span.start, span.end), kind: span.kind });
+    result += text.slice(cursor, span.start) + placeholder;
+    cursor = span.end;
+    counter++;
+  }
+  result += text.slice(cursor);
   return { text: result, blocks };
 }
 

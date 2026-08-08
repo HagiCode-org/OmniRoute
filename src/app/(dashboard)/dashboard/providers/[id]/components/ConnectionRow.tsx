@@ -20,6 +20,8 @@ import {
   providerText,
   ERROR_TYPE_LABELS,
 } from "../providerPageHelpers";
+import { getCodexPlanLabel } from "../codexPlanLabel";
+import ProviderQuotaVisibilityToggle from "./ProviderQuotaVisibilityToggle";
 
 // ---------------------------------------------------------------------------
 // Types (exported so the client can reference them without re-importing)
@@ -27,6 +29,7 @@ import {
 
 export interface ConnectionRowConnection {
   id?: string;
+  provider?: string;
   name?: string;
   email?: string;
   displayName?: string;
@@ -47,6 +50,7 @@ export interface ConnectionRowConnection {
   authType?: string;
   proxyEnabled?: boolean;
   perKeyProxyEnabled?: boolean;
+  quotaVisible?: boolean;
 }
 
 export interface ConnectionRowProps {
@@ -54,7 +58,6 @@ export interface ConnectionRowProps {
   isOAuth: boolean;
   isClaude?: boolean;
   isCodex?: boolean;
-  isGeminiCli?: boolean;
   codexGlobalServiceMode?: CodexGlobalServiceMode;
   isFirst: boolean;
   isLast: boolean;
@@ -64,6 +67,7 @@ export interface ConnectionRowProps {
   onMoveDown: () => void;
   onToggleActive: (isActive?: boolean) => void | Promise<void>;
   onToggleRateLimit: (enabled?: boolean) => void;
+  onToggleQuotaVisibility?: (visible: boolean) => void;
   onToggleClaudeExtraUsage?: (enabled?: boolean) => void;
   onToggleCodex5h?: (enabled?: boolean) => void;
   onToggleCodexWeekly?: (enabled?: boolean) => void;
@@ -79,6 +83,7 @@ export interface ConnectionRowProps {
   hasProxy?: boolean;
   proxySource?: string;
   proxyHost?: string;
+  proxyName?: string | null;
   proxyEnabled?: boolean;
   perKeyProxyEnabled?: boolean;
   onToggleProxyEnabled?: (enabled: boolean) => void;
@@ -93,10 +98,6 @@ export interface ConnectionRowProps {
   isApplyingClaudeAuthLocal?: boolean;
   onExportClaudeAuthFile?: () => void;
   isExportingClaudeAuthFile?: boolean;
-  onApplyGeminiAuthLocal?: () => void;
-  isApplyingGeminiAuthLocal?: boolean;
-  onExportGeminiAuthFile?: () => void;
-  isExportingGeminiAuthFile?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -340,7 +341,6 @@ export default function ConnectionRow({
   isOAuth,
   isClaude,
   isCodex,
-  isGeminiCli,
   codexGlobalServiceMode,
   isCcCompatible,
   cliproxyapiEnabled,
@@ -352,6 +352,7 @@ export default function ConnectionRow({
   onMoveDown,
   onToggleActive,
   onToggleRateLimit,
+  onToggleQuotaVisibility,
   onToggleClaudeExtraUsage,
   onToggleCodex5h,
   onToggleCodexWeekly,
@@ -365,6 +366,7 @@ export default function ConnectionRow({
   hasProxy,
   proxySource,
   proxyHost,
+  proxyName,
   onRefreshToken,
   isRefreshing,
   onApplyCodexAuthLocal,
@@ -375,10 +377,6 @@ export default function ConnectionRow({
   isApplyingClaudeAuthLocal,
   onExportClaudeAuthFile,
   isExportingClaudeAuthFile,
-  onApplyGeminiAuthLocal,
-  isApplyingGeminiAuthLocal,
-  onExportGeminiAuthFile,
-  isExportingGeminiAuthFile,
   perKeyProxyEnabled,
   onTogglePerKeyProxyEnabled,
   proxyEnabled,
@@ -409,15 +407,6 @@ export default function ConnectionRow({
     typeof t.has === "function" && t.has("exportClaudeAuthFile")
       ? t("exportClaudeAuthFile")
       : "Export auth";
-  const applyGeminiAuthLabel =
-    typeof t.has === "function" && t.has("applyGeminiAuthLocal")
-      ? t("applyGeminiAuthLocal")
-      : "Apply auth";
-  const exportGeminiAuthLabel =
-    typeof t.has === "function" && t.has("exportGeminiAuthFile")
-      ? t("exportGeminiAuthFile")
-      : "Export auth";
-
   // Use useState + useEffect for impure Date.now() to avoid calling during render
   const [isCooldown, setIsCooldown] = useState(false);
   // T12: token expiry status — lazy init avoids calling Date.now() during render;
@@ -465,6 +454,7 @@ export default function ConnectionRow({
 
   const statusPresentation = getStatusPresentation(connection, effectiveStatus, isCooldown, t);
   const rateLimitEnabled = !!connection.rateLimitProtection;
+  const quotaVisible = connection.quotaVisible !== false;
   const codexPolicy =
     connection.providerSpecificData &&
     typeof connection.providerSpecificData === "object" &&
@@ -522,6 +512,7 @@ export default function ConnectionRow({
   const claudeBlockExtraUsageEnabled = isClaude
     ? isClaudeExtraUsageBlockEnabled("claude", connection.providerSpecificData)
     : false;
+  const codexPlanLabel = getCodexPlanLabel(!!isCodex, connection.providerSpecificData);
   const cliproxyapiDeepMode = !!cliproxyapiEnabled;
 
   return (
@@ -563,16 +554,27 @@ export default function ConnectionRow({
             <Badge variant={statusPresentation.statusVariant as any} size="sm" dot>
               {statusPresentation.statusLabel}
             </Badge>
+            {codexPlanLabel && (
+              <Badge variant="primary" size="sm" className="capitalize">
+                {codexPlanLabel}
+              </Badge>
+            )}
             {/* T12: Token expiry status indicator (state-driven, no Date.now in render) */}
+            {/* #5836: the red "Token Expired" badge is TERMINAL-only — for OAuth
+               refresh-capable providers (Antigravity/Gemini) the access token lapses
+               ~hourly but is auto-refreshed, so a lapsed token alone must not paint
+               red. Gate it on testStatus === "expired" (continuation of #5326). */}
             {tokenMinsLeft !== null &&
               (tokenMinsLeft < 0 ? (
-                <span
-                  className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-xs font-medium bg-red-500/15 text-red-500"
-                  title={t("tokenExpiredTitle", { date: effectiveExpiresAt })}
-                >
-                  <span className="material-symbols-outlined text-[11px]">error</span>
-                  {t("tokenExpiredBadge")}
-                </span>
+                connection.testStatus === "expired" ? (
+                  <span
+                    className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-xs font-medium bg-red-500/15 text-red-500"
+                    title={t("tokenExpiredTitle", { date: effectiveExpiresAt })}
+                  >
+                    <span className="material-symbols-outlined text-[11px]">error</span>
+                    {t("tokenExpiredBadge")}
+                  </span>
+                ) : null
               ) : tokenMinsLeft < 30 ? (
                 <span
                   className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-xs font-medium bg-amber-500/15 text-amber-500"
@@ -629,6 +631,12 @@ export default function ConnectionRow({
               <span className="material-symbols-outlined text-[13px]">shield</span>
               {rateLimitEnabled ? t("rateLimitProtected") : t("rateLimitUnprotected")}
             </button>
+            {onToggleQuotaVisibility && (
+              <ProviderQuotaVisibilityToggle
+                visible={quotaVisible}
+                onToggle={onToggleQuotaVisibility}
+              />
+            )}
             {isClaude && (
               <>
                 <span className="text-text-muted/30 select-none">|</span>
@@ -777,7 +785,7 @@ export default function ConnectionRow({
                       })}
                     >
                       <span className="material-symbols-outlined text-[13px]">vpn_lock</span>
-                      {proxyHost || t("proxy")}
+                      {proxyName || proxyHost || t("proxy")}
                     </span>
                   </>
                 );
@@ -869,41 +877,13 @@ export default function ConnectionRow({
             {exportClaudeAuthLabel}
           </Button>
         )}
-        {isGeminiCli && onApplyGeminiAuthLocal && (
-          <Button
-            size="sm"
-            variant="ghost"
-            icon="install_desktop"
-            loading={isApplyingGeminiAuthLocal}
-            disabled={isApplyingGeminiAuthLocal}
-            onClick={onApplyGeminiAuthLocal}
-            className="!h-7 !px-2 text-xs text-emerald-500 hover:text-emerald-400"
-            title={applyGeminiAuthLabel}
-          >
-            {applyGeminiAuthLabel}
-          </Button>
-        )}
-        {isGeminiCli && onExportGeminiAuthFile && (
-          <Button
-            size="sm"
-            variant="ghost"
-            icon="download"
-            loading={isExportingGeminiAuthFile}
-            disabled={isExportingGeminiAuthFile}
-            onClick={onExportGeminiAuthFile}
-            className="!h-7 !px-2 text-xs text-sky-500 hover:text-sky-400"
-            title={exportGeminiAuthLabel}
-          >
-            {exportGeminiAuthLabel}
-          </Button>
-        )}
         <Toggle
           size="sm"
           checked={connection.isActive ?? true}
           onChange={onToggleActive}
           title={(connection.isActive ?? true) ? t("disableConnection") : t("enableConnection")}
         />
-        <div className="flex gap-1 ml-1 transition-opacity">
+        <div className="flex gap-1 ms-1 transition-opacity">
           {onReauth && (
             <button
               onClick={onReauth}

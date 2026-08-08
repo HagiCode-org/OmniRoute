@@ -1,8 +1,15 @@
 // Web-cookie provider key validators (part B): muse-spark-web, adapta-web, claude-web, gemini-web,
-// copilot-web, t3-web, jules, inner-ai. Extracted from validation.ts (god-file decomposition) —
-// top-level functions with no dispatcher-state captures; behavior is byte-identical to the inline defs.
+// copilot-web, t3-web, jules, devin (cloud-agent), inner-ai. Extracted from validation.ts (god-file
+// decomposition) — top-level functions with no dispatcher-state captures; behavior is byte-identical
+// to the inline defs.
 import { applyCustomUserAgent } from "./headers";
-import { toValidationErrorResult, validationRead, validationWrite } from "./transport";
+import {
+  isSecurityBlockError,
+  toValidationErrorResult,
+  validationRead,
+  validationWrite,
+} from "./transport";
+import { SafeOutboundFetchError } from "@/shared/network/safeOutboundFetch";
 import { normalizeSessionCookieHeader } from "@/lib/providers/webCookieAuth";
 import { buildJulesApiUrl } from "@/lib/cloudAgent/julesApi.ts";
 import {
@@ -88,7 +95,7 @@ export async function validateAdaptaWebProvider({ apiKey, providerSpecificData =
         {
           Cookie: `__client=${clientJwt}`,
           "User-Agent":
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
           Origin: "https://agent.adapta.one",
         },
         providerSpecificData
@@ -149,7 +156,7 @@ export async function validateClaudeWebProvider({ apiKey, providerSpecificData =
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
             "User-Agent":
-              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
             "anthropic-client-platform": "web_claude_ai",
           },
           providerSpecificData
@@ -233,6 +240,21 @@ export async function validateGeminiWebProvider({ apiKey, providerSpecificData =
 
     return { valid: false, error: `Gemini validation failed (${response.status})` };
   } catch (error: any) {
+    // #7859: gemini.google.com/app answers EVERY session probe (valid or not) with a
+    // 302 redirect (typically onward to accounts.google.com). validationRead() uses the
+    // no-redirect preset, so safeOutboundFetch throws REDIRECT_BLOCKED before the
+    // "200/302 = valid" status check above ever runs. A redirect to a PUBLIC host means
+    // the redirect was never followed (no SSRF) and is exactly what a valid Gemini
+    // session looks like here, so treat it as success. A redirect to a private/internal
+    // host is a genuine SSRF signal and must stay invalid — isSecurityBlockError()
+    // already makes that distinction.
+    if (
+      error instanceof SafeOutboundFetchError &&
+      error.code === "REDIRECT_BLOCKED" &&
+      !isSecurityBlockError(error)
+    ) {
+      return { valid: true, error: null };
+    }
     return toValidationErrorResult(error);
   }
 }
@@ -289,6 +311,91 @@ export async function validateCopilotWebProvider({ apiKey, providerSpecificData 
   } catch (error: any) {
     return toValidationErrorResult(error);
   }
+}
+
+export function extractM365CredentialParts(raw: string, providerSpecificData: Record<string, unknown>) {
+  const text = raw.trim();
+  const parts: Record<string, string> = {};
+
+  for (const segment of text.split(/[;\n]/)) {
+    const index = segment.indexOf("=");
+    if (index <= 0) continue;
+    const key = segment.slice(0, index).trim();
+    const value = segment.slice(index + 1).trim();
+    if (key && value) parts[key] = value;
+  }
+
+  // Accept the current M365 web endpoint (m365.cloud.microsoft, including
+  // regional subdomains) plus the two legacy hosts (substrate.office.com,
+  // copilot.microsoft.com). The path still carries /m365Copilot/Chathub/<tenant>,
+  // so extraction is unchanged. (OmniRoute issue #7078)
+  if (/^wss:\/\//i.test(text)) {
+    try {
+      const url = new URL(text);
+      const hostOk = /^(?:[\w-]+\.)*(?:m365\.cloud\.microsoft|copilot\.microsoft\.com|substrate\.office\.com)$/i.test(
+        url.hostname
+      );
+      if (hostOk && url.pathname.startsWith("/m365Copilot/Chathub/")) {
+        parts.access_token ||= url.searchParams.get("access_token") || "";
+        parts.chathubPath ||= decodeURIComponent(
+          url.pathname.split("/m365Copilot/Chathub/")[1] || ""
+        );
+      }
+    } catch {
+      // Fall through to the structured key/value parser result.
+    }
+  }
+
+  return {
+    accessToken:
+      parts.access_token ||
+      parts.accessToken ||
+      (typeof providerSpecificData.access_token === "string"
+        ? providerSpecificData.access_token
+        : "") ||
+      (typeof providerSpecificData.accessToken === "string" ? providerSpecificData.accessToken : ""),
+    chathubPath:
+      parts.chathubPath ||
+      parts.userTenant ||
+      (typeof providerSpecificData.chathubPath === "string"
+        ? providerSpecificData.chathubPath
+        : "") ||
+      (typeof providerSpecificData.userTenant === "string" ? providerSpecificData.userTenant : ""),
+  };
+}
+
+// ── Microsoft 365 Copilot Web token validator ──
+export async function validateCopilotM365WebProvider({
+  apiKey,
+  providerSpecificData = {},
+}: any) {
+  const { accessToken, chathubPath } = extractM365CredentialParts(
+    String(apiKey || ""),
+    providerSpecificData
+  );
+
+  if (!accessToken) {
+    return {
+      valid: false,
+      error: "Could not extract access_token from the Microsoft 365 Copilot credential",
+    };
+  }
+
+  if (!chathubPath || !chathubPath.includes("@")) {
+    return {
+      valid: false,
+      error: "Could not extract the account-specific Chathub path from the credential",
+    };
+  }
+
+  // The live provider uses a SignalR WebSocket. The generic web-cookie /models
+  // probe builds an invalid wss://.../models URL, so validation here confirms
+  // the captured credential shape and lets the executor perform the live check.
+  return {
+    valid: true,
+    error: null,
+    warning: "Credential format accepted. The session is verified when the provider sends a chat.",
+  };
 }
 
 // ── t3.chat Web cookie validator ──
@@ -373,6 +480,89 @@ export async function validateJulesProvider({ apiKey }: { apiKey: string }) {
       error: errorText.trim() || `Jules API returned ${response.status}`,
     };
   } catch (error: unknown) {
+    return toValidationErrorResult(error);
+  }
+}
+
+/**
+ * Devin cloud-agent (Cognition) — GET /v1/sessions with Bearer auth
+ * (see docs.devin.ai/api-reference/sessions/list-sessions). Distinct from the
+ * "devin-cli" LLM provider (ACP), which is already wired via providerRegistry.
+ */
+export async function validateDevinCloudAgentProvider({ apiKey }: { apiKey: string }) {
+  try {
+    const response = await validationWrite("https://api.devin.ai/v1/sessions?limit=1", {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+      },
+    });
+
+    if (response.status === 401 || response.status === 403) {
+      return { valid: false, error: "Invalid API key" };
+    }
+
+    if (response.ok) {
+      return { valid: true, error: null };
+    }
+
+    const errorText = await response.text().catch(() => "");
+    return {
+      valid: false,
+      error: errorText.trim() || `Devin API returned ${response.status}`,
+    };
+  } catch (error: unknown) {
+    return toValidationErrorResult(error);
+  }
+}
+
+// ── Notion AI Web (Unofficial/Experimental) cookie validator ──
+// #6758: no public Notion inference API exists; validate by probing a stable,
+// low-privilege authenticated Notion endpoint (getSpaces) with the session
+// cookie rather than the experimental runInferenceTranscript endpoint itself
+// (a live inference call is expensive and unnecessary just to confirm the
+// session is valid).
+export async function validateNotionWebProvider({ apiKey, providerSpecificData = {} }: any) {
+  try {
+    const raw = String(apiKey || "").trim();
+    if (!raw) {
+      return { valid: false, error: "Paste your token_v2 cookie value from notion.so" };
+    }
+
+    const cookieHeader = raw.includes("=") ? raw : `token_v2=${raw}`;
+
+    const response = await validationWrite("https://www.notion.so/api/v3/getSpaces", {
+      method: "POST",
+      headers: applyCustomUserAgent(
+        {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          Cookie: cookieHeader,
+          Origin: "https://www.notion.so",
+          Referer: "https://www.notion.so/",
+        },
+        providerSpecificData
+      ),
+      body: "{}",
+    });
+
+    if (response.status === 401 || response.status === 403) {
+      return {
+        valid: false,
+        error: "Invalid or expired token_v2 cookie — re-paste from notion.so DevTools → Cookies",
+      };
+    }
+
+    if (response.status >= 500) {
+      return { valid: false, error: `Notion unavailable (${response.status})` };
+    }
+
+    if (response.ok) {
+      return { valid: true, error: null };
+    }
+
+    return { valid: false, error: `Notion validation failed (${response.status})` };
+  } catch (error: any) {
     return toValidationErrorResult(error);
   }
 }

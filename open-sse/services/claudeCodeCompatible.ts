@@ -2,6 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 
 import { getStainlessTimeoutSeconds } from "@/shared/utils/runtimeTimeouts";
 import { ANTHROPIC_VERSION_HEADER } from "../config/anthropicHeaders.ts";
+import {
+  CLAUDE_CODE_COMPATIBLE_STAINLESS_PACKAGE_VERSION,
+  CLAUDE_CODE_COMPATIBLE_STAINLESS_RUNTIME_VERSION,
+  CLAUDE_CODE_COMPATIBLE_USER_AGENT,
+} from "../config/claudeCodeCompatibleIdentity.ts";
 import { supportsClaudeMaxEffort, supportsXHighEffort } from "../config/providerModels.ts";
 import { prepareClaudeRequest } from "../translator/helpers/claudeHelper.ts";
 import { signRequestBody } from "./claudeCodeCCH.ts";
@@ -15,6 +20,8 @@ import {
 import { applyClaudeCodeCompatibleThinkingDisplay } from "./claudeCodeCompatibleThinkingDisplay.ts";
 import { obfuscateInBody } from "./claudeCodeObfuscation.ts";
 import { applySystemTransformPipeline, PROVIDER_CC_BRIDGE } from "./systemTransforms.ts";
+import { usesCcWireImage } from "./ccWireImageBuiltins.ts";
+import { collectClaudeMediaBlocks, convertOpenAiMediaBlock } from "./ccOpenAiMediaBlocks.ts";
 import {
   fixToolPairs,
   fixToolAdjacency,
@@ -41,10 +48,7 @@ export {
   CLAUDE_CODE_COMPATIBLE_REDACT_THINKING_BETA,
   resolveClaudeCodeCompatibleAnthropicBeta,
 } from "./claudeCodeCompatibleBeta.ts";
-export const CLAUDE_CODE_COMPATIBLE_VERSION = "2.1.187";
-export const CLAUDE_CODE_COMPATIBLE_USER_AGENT = "claude-cli/2.1.187 (external, sdk-cli)";
-export const CLAUDE_CODE_COMPATIBLE_STAINLESS_PACKAGE_VERSION = "0.94.0";
-export const CLAUDE_CODE_COMPATIBLE_STAINLESS_RUNTIME_VERSION = "v24.3.0";
+export * from "../config/claudeCodeCompatibleIdentity.ts";
 export const CONTEXT_1M_BETA_HEADER = "context-1m-2025-08-07";
 const CLAUDE_CODE_COMPATIBLE_DEFAULT_SYSTEM_BLOCKS = [
   {
@@ -54,6 +58,8 @@ const CLAUDE_CODE_COMPATIBLE_DEFAULT_SYSTEM_BLOCKS = [
 ];
 const CONTEXT_1M_SUPPORTED_MODELS = [
   "claude-fable-5",
+  "claude-sonnet-5",
+  "claude-sonnet-4-6",
   "claude-opus-4-8",
   "claude-opus-4-7",
   "claude-opus-4-6",
@@ -61,7 +67,6 @@ const CONTEXT_1M_SUPPORTED_MODELS = [
 export const CLAUDE_CODE_COMPATIBLE_STAINLESS_TIMEOUT_SECONDS = getStainlessTimeoutSeconds(
   process.env
 );
-
 type HeaderLike =
   | Headers
   | Record<string, string | undefined>
@@ -94,7 +99,12 @@ function supportsClaudeXHighEffort(model: string | null | undefined): boolean {
 }
 
 export function isClaudeCodeCompatibleProvider(provider: string | null | undefined): boolean {
-  return typeof provider === "string" && provider.startsWith(CLAUDE_CODE_COMPATIBLE_PREFIX);
+  return (
+    (typeof provider === "string" && provider.startsWith(CLAUDE_CODE_COMPATIBLE_PREFIX)) ||
+    // Built-in providers (e.g. agentrouter) that adopt the dynamic CC wire image
+    // while keeping their own registry baseUrl + auth (#6056).
+    usesCcWireImage(provider)
+  );
 }
 
 export function stripAnthropicMessagesSuffix(baseUrl: string | null | undefined): string {
@@ -175,13 +185,12 @@ export function buildClaudeCodeCompatibleHeaders(
   sessionId?: string | null,
   options: { redactThinking?: boolean } = {}
 ): Record<string, string> {
-  void stream;
   // These headers intentionally mirror Claude Code's wire image closely.
   // For CC-compatible relays, passing the upstream's client-gating checks is
   // more important than forwarding arbitrary caller-specific header shapes.
   return {
     "Content-Type": "application/json",
-    Accept: "application/json",
+    Accept: stream ? "text/event-stream" : "application/json",
     Authorization: `Bearer ${apiKey}`,
     "anthropic-version": CLAUDE_CODE_COMPATIBLE_ANTHROPIC_VERSION,
     "anthropic-beta": resolveClaudeCodeCompatibleAnthropicBeta({
@@ -510,13 +519,13 @@ function buildClaudeCodeCompatibleMessages(messages: MessageLike[]) {
         message
       ): message is {
         role: "user" | "assistant";
-        content: Array<{ type: string; text: string }>;
+        content: Array<Record<string, unknown>>;
       } => !!message && message.content.length > 0
     );
 
   const merged: Array<{
     role: "user" | "assistant";
-    content: Array<{ type: string; text: string }>;
+    content: Array<Record<string, unknown>>;
   }> = [];
 
   for (const message of converted) {
@@ -712,12 +721,12 @@ function convertClaudeCodeCompatibleMessage(message: MessageLike | null | undefi
   if (!role) return null;
 
   const text = contentToText(message?.content);
-  if (!text) return null;
+  // #7777: keep the user-turn media parts that contentToText() above drops.
+  const media = role === "user" ? collectClaudeMediaBlocks(message?.content) : [];
+  const content = [...(text ? [{ type: "text", text }] : []), ...media];
+  if (content.length === 0) return null;
 
-  return {
-    role,
-    content: [{ type: "text", text }],
-  };
+  return { role, content };
 }
 
 function buildClaudeCodeCompatibleTools(
@@ -970,7 +979,7 @@ function normalizeClaudeContentBlock(block: unknown) {
     };
   }
 
-  return record;
+  return convertOpenAiMediaBlock(record) ?? record;
 }
 
 function convertClaudeCodeCompatibleClaudeMessage(

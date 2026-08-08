@@ -17,6 +17,8 @@ import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { QUOTA_MODEL_PREFIX } from "@/lib/quota/quotaModelNaming";
 import { comboErrorResponse } from "@/lib/api/comboErrorResponse";
+import { ComboInvariantError } from "@/lib/combos/invariants";
+import { buildComboNameCollisionWarning } from "@/lib/combos/modelNameCollision";
 
 // Minimal shape for the fields we read off a combo row in this route.
 // `getComboById` returns a structurally `JsonRecord`-typed object, so we
@@ -117,10 +119,17 @@ export async function PUT(request, { params }) {
     const { id } = await params;
     const validation = validateBody(updateComboSchema, rawBody);
     if (isValidationFailure(validation)) {
+      // Surface the first field-level issue so clients can highlight the
+      // offending field without parsing the full issues array (#5083 Bug 3).
+      const firstDetail = validation.error.details?.[0] ?? null;
       return comboErrorResponse(
         "COMBO_002",
         400,
-        { issues: validation.error },
+        {
+          issues: validation.error,
+          firstField: firstDetail?.field ?? null,
+          firstMessage: firstDetail?.message ?? null,
+        },
         request
       );
     }
@@ -241,8 +250,17 @@ export async function PUT(request, { params }) {
     // Auto sync to Cloud if enabled
     await syncToCloudIfEnabled();
 
-    return NextResponse.json(combo);
+    // #8530: a combo renamed to a real model id is a supported pattern
+    // (#6940 — bare-model-id provider fallback), so it is never rejected.
+    // Surface it as a non-blocking warning instead of silently shadowing it.
+    const warning = comboName
+      ? buildComboNameCollisionWarning(String(comboName))
+      : null;
+    return NextResponse.json(warning ? { ...combo, warning } : combo);
   } catch (error) {
+    if (error instanceof ComboInvariantError) {
+      return comboErrorResponse("COMBO_008", 400, { reason: error.message }, request);
+    }
     console.log("Error updating combo:", error);
     return comboErrorResponse("INTERNAL_001", 500, undefined, request);
   }

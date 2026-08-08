@@ -19,12 +19,26 @@ import { USAGE_SUPPORTED_PROVIDERS } from "@/shared/constants/providers";
 import { pickDisplayValue } from "@/shared/utils/maskEmail";
 import useEmailPrivacyStore from "@/store/emailPrivacyStore";
 import { useNotificationStore } from "@/store/notificationStore";
+
+import { useQuotaVisibility } from "./useQuotaVisibility";
 import QuotaCutoffModal from "./QuotaCutoffModal";
 import QuotaCardGrid from "./QuotaCardGrid";
+import CodexResetCreditsModal from "./CodexResetCreditsModal";
 import { useVisibleQuotaData } from "./useVisibleQuotaData";
+import { useCodexResetCreditRedemption } from "./useCodexResetCreditRedemption";
+import { PROVIDER_LABEL, PROVIDER_ORDER, TIER_FILTERS } from "./constants";
 import { formatAutoRefreshCountdown } from "./formatters";
 import { translateUsageOrFallback, type UsageTranslationValues } from "./i18nFallback";
 import { compareTr } from "@/shared/utils/turkishText";
+import { fetchWithTimeout } from "@/shared/utils/fetchTimeout";
+import { isProviderQuotaVisible } from "@/shared/utils/providerQuotaVisibility";
+
+// Bound the two first-paint requests so a stalled connection cannot wedge
+// `initialLoading` on `true` and freeze the quota page on its skeleton forever
+// (same infinite-skeleton class as the providers page). A `try/catch` degrades a
+// *rejection* to a default, but only a timeout/abort can rescue a `fetch()` that
+// never settles (browser connection-pool starvation under the RSC prefetch storm).
+const PROVIDER_LIMITS_FETCH_TIMEOUT_MS = 20_000;
 
 const LS_PURCHASE_FILTER = "omniroute:limits:purchaseFilter";
 const LS_STATUS_FILTER = "omniroute:limits:statusFilter";
@@ -34,58 +48,6 @@ const LS_PROVIDER_FILTER = "omniroute:limits:providerFilter";
 const MIN_FETCH_INTERVAL_MS = 30000;
 const QUOTA_BAR_GREEN_THRESHOLD = 50;
 const QUOTA_BAR_YELLOW_THRESHOLD = 20;
-
-const PROVIDER_LABEL: Record<string, string> = {
-  antigravity: "Antigravity",
-  "gemini-cli": "Gemini CLI",
-  github: "GitHub Copilot",
-  kiro: "Kiro AI",
-  "amazon-q": "Amazon Q",
-  codex: "OpenAI Codex",
-  claude: "Claude Code",
-  glm: "GLM (Z.AI)",
-  zai: "Z.AI",
-  glmt: "GLM Thinking",
-  "opencode-go": "OpenCode Go",
-  "ollama-cloud": "Ollama Cloud",
-  "kimi-coding": "Kimi Coding",
-  minimax: "MiniMax",
-  "minimax-cn": "MiniMax CN",
-  nanogpt: "NanoGPT",
-  deepseek: "DeepSeek",
-};
-
-// Group ordering — single source of truth for provider placement.
-const PROVIDER_ORDER: Record<string, number> = {
-  antigravity: 1,
-  "gemini-cli": 2,
-  github: 3,
-  codex: 4,
-  claude: 5,
-  kiro: 6,
-  glm: 7,
-  zai: 8,
-  glmt: 9,
-  "opencode-go": 10,
-  "ollama-cloud": 11,
-  "kimi-coding": 12,
-  minimax: 13,
-  "minimax-cn": 14,
-  nanogpt: 15,
-};
-
-const TIER_FILTERS = [
-  { key: "all", labelKey: "tierAll" },
-  { key: "enterprise", labelKey: "tierEnterprise" },
-  { key: "team", labelKey: "tierTeam" },
-  { key: "business", labelKey: "tierBusiness" },
-  { key: "ultra", labelKey: "tierUltra" },
-  { key: "pro", labelKey: "tierPro" },
-  { key: "plus", labelKey: "tierPlus" },
-  { key: "lite", labelKey: "tierLite" },
-  { key: "free", labelKey: "tierFree" },
-  { key: "unknown", labelKey: "tierUnknown" },
-];
 
 type PurchaseTypeKey = "all" | "oauth-free" | "oauth-sub" | "apikey";
 type StatusKey = "all" | "critical" | "alert" | "ok" | "empty";
@@ -241,6 +203,13 @@ export default function ProviderLimits({
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [initialLoading, setInitialLoading] = useState(true);
   const [tierFilter, setTierFilter] = useState("all");
+  const { quotaVisibility, handleHideQuota, handleShowQuota } = useQuotaVisibility(tr, notify);
+  const resetCreditRedemption = useCodexResetCreditRedemption(
+    tr,
+    setErrors,
+    setQuotaData,
+    setLastRefreshedAt
+  );
 
   const [purchaseTypeFilter, setPurchaseTypeFilter] = useState<PurchaseTypeKey>(() => {
     if (typeof window === "undefined") return "all";
@@ -313,7 +282,9 @@ export default function ProviderLimits({
 
   const fetchConnections = useCallback(async () => {
     try {
-      const response = await fetch("/api/providers/client");
+      const response = await fetchWithTimeout("/api/providers/client", {
+        timeoutMs: PROVIDER_LIMITS_FETCH_TIMEOUT_MS,
+      });
       if (!response.ok) throw new Error("Failed");
       const data = await response.json();
       const list = data.connections || [];
@@ -384,7 +355,9 @@ export default function ProviderLimits({
 
   const fetchCachedProviderLimits = useCallback(async () => {
     try {
-      const response = await fetch("/api/usage/provider-limits");
+      const response = await fetchWithTimeout("/api/usage/provider-limits", {
+        timeoutMs: PROVIDER_LIMITS_FETCH_TIMEOUT_MS,
+      });
       if (!response.ok) throw new Error("Failed");
       const data = await response.json();
       return data.caches || {};
@@ -548,6 +521,7 @@ export default function ProviderLimits({
     () =>
       connections.filter(
         (conn) =>
+          isProviderQuotaVisible(conn) &&
           USAGE_SUPPORTED_PROVIDERS.includes(conn.provider) &&
           (conn.authType === "oauth" || conn.authType === "apikey")
       ),
@@ -1066,10 +1040,27 @@ export default function ProviderLimits({
             setCutoffModalWindows(windows);
             setCutoffModalConn(conn);
           }}
+          onOpenResetCredits={resetCreditRedemption.openCodexResetCredits}
           onToggleActive={handleToggleActive}
           togglingActiveId={togglingActiveId}
+          quotaVisibility={quotaVisibility}
+          onHideQuota={handleHideQuota}
+          onShowQuota={handleShowQuota}
+          redeemingResetCreditId={resetCreditRedemption.redeemingResetCreditId}
+          loadingResetCreditsId={resetCreditRedemption.loadingResetCreditsId}
         />
       </div>
+
+      {resetCreditRedemption.resetCreditPicker && (
+        <CodexResetCreditsModal
+          isOpen={true}
+          credits={resetCreditRedemption.resetCreditPicker.credits}
+          availableCount={resetCreditRedemption.resetCreditPicker.availableCount}
+          loading={resetCreditRedemption.redeemingResetCreditId !== null}
+          onClose={resetCreditRedemption.closeResetCreditPicker}
+          onRedeem={resetCreditRedemption.redeemCodexResetCredit}
+        />
+      )}
 
       {cutoffModalConn && (
         <QuotaCutoffModal
@@ -1078,6 +1069,7 @@ export default function ProviderLimits({
             setCutoffModalConn(null);
             setCutoffModalWindows([]);
           }}
+          connectionId={cutoffModalConn.id}
           connectionName={
             pickDisplayValue(
               [cutoffModalConn.name, cutoffModalConn.displayName, cutoffModalConn.email],
