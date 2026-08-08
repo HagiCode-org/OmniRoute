@@ -58,7 +58,7 @@ const TOKEN_PASTE_PROVIDERS = new Set(["windsurf", "devin-cli", "grok-cli"]);
  * Phase 2 will reintroduce browser login via Firebase OAuth + RegisterUser.
  * Spec: _tasks/superpowers/specs/2026-05-29-windsurf-login-fix-design.md.
  */
-const IMPORT_TOKEN_ONLY_PROVIDERS = new Set(["windsurf", "devin-cli"]);
+const IMPORT_TOKEN_ONLY_PROVIDERS = new Set(["windsurf", "devin-cli", "grok-cli"]);
 
 // POST a bare Codex access token to the access-token-only import endpoint
 // (#1290); shared by the bare-JWT and session-JSON paste branches (#6636).

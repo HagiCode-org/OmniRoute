@@ -424,6 +424,16 @@ export default function ProviderModalsPanel({
           }}
         />
       )}
+      {providerId === "grok-cli" && importGrokCliModalOpen && (
+        <ImportGrokCliAuthModal
+          key="import-grok-cli-modal"
+          onClose={() => setImportGrokCliModalOpen(false)}
+          onSuccess={() => {
+            setImportGrokCliModalOpen(false);
+            void fetchConnections();
+          }}
+        />
+      )}
       <BatchTestResultsModal
         batchTestResults={batchTestResults}
         providerInfo={providerInfo}

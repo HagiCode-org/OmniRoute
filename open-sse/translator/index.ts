@@ -9,6 +9,7 @@ import {
   prepareClaudeRequest,
 } from "./helpers/claudeHelper.ts";
 import { filterToOpenAIFormat } from "./helpers/openaiHelper.ts";
+import { providerHonorsOpenAIFormatCacheControl } from "../utils/cacheControlPolicy.ts";
 import {
   providerHonorsOpenAIFormatCacheControl,
   resolveConnectionCacheOverride,

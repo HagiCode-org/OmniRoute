@@ -349,24 +349,24 @@ Use the dashboard at `/dashboard/providers` to enable, configure, and test each 
 
 ## Upstream Proxy Providers (2)
 
-| ID | Alias | Name | Tags | Website | Notes |
-|----|-------|------|------|---------|-------|
-| `9router` | `nr` | 9router | Upstream proxy | [link](https://www.npmjs.com/package/9router) | — |
-| `cliproxyapi` | `cpa` | CLIProxyAPI | Upstream proxy | [link](https://github.com/router-for-me/CLIProxyAPI) | — |
+| ID            | Alias | Name        | Tags           | Website                                              | Notes |
+| ------------- | ----- | ----------- | -------------- | ---------------------------------------------------- | ----- |
+| `9router`     | `nr`  | 9router     | Upstream proxy | [link](https://www.npmjs.com/package/9router)        | —     |
+| `cliproxyapi` | `cpa` | CLIProxyAPI | Upstream proxy | [link](https://github.com/router-for-me/CLIProxyAPI) | —     |
 
 ## Cloud Agent Providers (3)
 
-| ID | Alias | Name | Tags | Website | Notes |
-|----|-------|------|------|---------|-------|
-| `codex-cloud` | `codex-cloud` | Codex Cloud | Cloud agent | [link](https://openai.com/codex) | OpenAI API key with Codex Cloud task access. |
-| `devin` | `devin` | Devin | Cloud agent | [link](https://devin.ai) | Devin API key for cloud agent sessions. |
-| `jules` | `jules` | Google Jules | Cloud agent | [link](https://jules.google) | Jules API key for creating and managing cloud coding tasks. |
+| ID            | Alias         | Name         | Tags        | Website                          | Notes                                                       |
+| ------------- | ------------- | ------------ | ----------- | -------------------------------- | ----------------------------------------------------------- |
+| `codex-cloud` | `codex-cloud` | Codex Cloud  | Cloud agent | [link](https://openai.com/codex) | OpenAI API key with Codex Cloud task access.                |
+| `devin`       | `devin`       | Devin        | Cloud agent | [link](https://devin.ai)         | Devin API key for cloud agent sessions.                     |
+| `jules`       | `jules`       | Google Jules | Cloud agent | [link](https://jules.google)     | Jules API key for creating and managing cloud coding tasks. |
 
 ## System Providers (1)
 
-| ID | Alias | Name | Tags | Website | Notes |
-|----|-------|------|------|---------|-------|
-| `auto` | `auto` | Auto (Zero-Config) | System | — | — |
+| ID     | Alias  | Name               | Tags   | Website | Notes |
+| ------ | ------ | ------------------ | ------ | ------- | ----- |
+| `auto` | `auto` | Auto (Zero-Config) | System | —       | —     |
 
 ## Sources of truth
 

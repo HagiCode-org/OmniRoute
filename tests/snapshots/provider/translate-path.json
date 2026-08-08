@@ -3995,6 +3995,29 @@
       "stream": "https://api.poe.com/v1/chat/completions"
     }
   },
+  "pioneer": {
+    "format": "openai",
+    "headers": {
+      "apiKey": {
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json",
+        "x-api-key": "<CRED>"
+      },
+      "nonStream": {
+        "Content-Type": "application/json",
+        "x-api-key": "<CRED>"
+      },
+      "oauth": {
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json",
+        "x-api-key": "<CRED>"
+      }
+    },
+    "url": {
+      "nonStream": "https://api.pioneer.ai/v1/chat/completions",
+      "stream": "https://api.pioneer.ai/v1/chat/completions"
+    }
+  },
   "pollinations": {
     "format": "openai",
     "headers": {
