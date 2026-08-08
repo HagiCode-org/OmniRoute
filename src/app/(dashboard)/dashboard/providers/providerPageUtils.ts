@@ -436,6 +436,7 @@ export interface ProviderPageData {
   expirations: any | null;
   blockedProviders: string[] | null;
   settings: any | null;
+  authRequired: boolean;
 }
 
 // Bound each first-paint request so a single stalled connection cannot freeze
@@ -462,9 +463,12 @@ export async function loadProviderPageData(
   fetchImpl: typeof fetch = globalThis.fetch as typeof fetch,
   timeoutMs: number = PROVIDER_PAGE_FETCH_TIMEOUT_MS
 ): Promise<ProviderPageData> {
+  const AUTH_REQUIRED = "__AUTH_REQUIRED__";
+
   const safeJson = async (url: string, init?: RequestInit): Promise<any | null> => {
     try {
       const res = await fetchWithTimeout(url, { ...init, timeoutMs, fetchFn: fetchImpl });
+      if (res.status === 401) return AUTH_REQUIRED;
       if (!res.ok) return null;
       return await res.json();
     } catch {
@@ -481,7 +485,10 @@ export async function loadProviderPageData(
   ]);
 
   return {
-    connections: Array.isArray(connectionsData?.connections) ? connectionsData.connections : [],
+    connections:
+      connectionsData !== AUTH_REQUIRED && Array.isArray(connectionsData?.connections)
+        ? connectionsData.connections
+        : [],
     providerNodes: Array.isArray(nodesData?.nodes) ? nodesData.nodes : [],
     ccCompatibleProviderEnabled: nodesData?.ccCompatibleProviderEnabled === true,
     expirations: expirationsData ?? null,
@@ -489,5 +496,6 @@ export async function loadProviderPageData(
       ? settingsData.blockedProviders
       : null,
     settings: settingsData ?? null,
+    authRequired: connectionsData === AUTH_REQUIRED,
   };
 }

@@ -251,6 +251,10 @@ export default function ProvidersPage() {
         // stalled connection can no longer wedge `loading` on `true` and freeze
         // the page on its skeleton forever.
         const data = await loadProviderPageData();
+        if (data.authRequired) {
+          router.replace("/login");
+          return;
+        }
         setConnections(data.connections);
         setProviderNodes(data.providerNodes);
         setCcCompatibleProviderEnabled(data.ccCompatibleProviderEnabled);
@@ -264,7 +268,7 @@ export default function ProvidersPage() {
       }
     };
     fetchData();
-  }, []);
+  }, [router]);
 
   useEffect(() => {
     if (!shouldSyncProviderDisplayMode(displayModePreferenceReady, loading)) return;
