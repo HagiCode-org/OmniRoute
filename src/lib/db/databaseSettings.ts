@@ -3,9 +3,10 @@ import fs from "node:fs";
 import { DEFAULT_DATABASE_SETTINGS, type DatabaseSettings } from "@/types/databaseSettings";
 
 import { backupDbFile } from "./backup";
-import { DATA_DIR, SQLITE_FILE, getDbInstance } from "./core";
+import { DATA_DIR, SQLITE_FILE, applyDatabaseOptimizationSettings, getDbInstance } from "./core";
 import { invalidateDbCache } from "./readCache";
 import { getDatabaseStats } from "./stats";
+import { getState as getVacuumSchedulerState, refreshVacuumScheduler } from "./vacuumScheduler";
 
 const DATABASE_SETTINGS_NAMESPACE = "databaseSettings";
 
@@ -39,6 +40,7 @@ const LEGACY_FLAT_KEYS: {
     promptCacheEnabled: ["promptCacheEnabled"],
     promptCacheStrategy: ["promptCacheStrategy"],
     alwaysPreserveClientCache: ["alwaysPreserveClientCache"],
+    modelCatalogCacheTtlMs: ["modelCatalogCacheTtlMs"],
   },
   retention: {
     quotaSnapshots: ["quotaSnapshots"],
@@ -48,6 +50,10 @@ const LEGACY_FLAT_KEYS: {
     callLogs: ["callLogs"],
     usageHistory: ["usageHistory"],
     memoryEntries: ["memoryEntries"],
+    domainCostHistory: ["domainCostHistory"],
+    compressionCacheStats: ["compressionCacheStats"],
+    xpAuditLog: ["xpAuditLog"],
+    compressionRunTelemetry: ["compressionRunTelemetry"],
     autoCleanupEnabled: ["autoCleanupEnabled"],
   },
   aggregation: {
@@ -83,6 +89,26 @@ function parseStoredValue(rawValue: unknown): unknown {
   }
 }
 
+function toBooleanSetting(value: unknown): boolean | null {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return !Number.isNaN(value) && value !== 0;
+  if (typeof value !== "string") return null;
+
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return null;
+}
+
+function normalizeOptimizationSettings(settings: UserDatabaseSettings) {
+  const fallback = DEFAULT_DATABASE_SETTINGS.optimization.cacheSize;
+  const numericCacheSize = Number(settings.optimization.cacheSize);
+  settings.optimization.cacheSize =
+    Number.isFinite(numericCacheSize) && numericCacheSize > 0
+      ? Math.min(1000000, Math.floor(numericCacheSize))
+      : fallback;
+}
+
 function readNamespace(namespace: string): Record<string, unknown> {
   const db = getDbInstance();
   const rows = db
@@ -116,6 +142,18 @@ function mergeSectionObject(
 function mergeTopLevelSections(target: UserDatabaseSettings, values: Record<string, unknown>) {
   for (const section of DATABASE_SETTINGS_SECTIONS) {
     mergeSectionObject(target, section, values[section]);
+  }
+}
+
+function mergeRuntimeLogSettings(target: UserDatabaseSettings, values: Record<string, unknown>) {
+  const pipelineEnabled = toBooleanSetting(values.call_log_pipeline_enabled);
+  if (pipelineEnabled !== null) {
+    target.logs.callLogPipelineEnabled = pipelineEnabled;
+  }
+
+  const legacyDetailedEnabled = toBooleanSetting(values.detailed_logs_enabled);
+  if (legacyDetailedEnabled !== null) {
+    target.logs.detailedLogsEnabled = legacyDetailedEnabled;
   }
 }
 
@@ -195,12 +233,15 @@ export function getUserDatabaseSettings(): UserDatabaseSettings {
 
   mergeTopLevelSections(settings, mainSettings);
   mergeDatabaseSettingsNamespace(settings, readNamespace(DATABASE_SETTINGS_NAMESPACE));
+  mergeRuntimeLogSettings(settings, mainSettings);
+  normalizeOptimizationSettings(settings);
 
   return settings;
 }
 
 export function getDatabaseSettings(): DatabaseSettings {
   const dbStats = getDatabaseStats();
+  const vacuumState = getVacuumSchedulerState();
 
   return {
     ...getUserDatabaseSettings(),
@@ -214,7 +255,8 @@ export function getDatabaseSettings(): DatabaseSettings {
       databaseSizeBytes: dbStats.totalSize,
       pageCount: dbStats.pageCount,
       freelistCount: getFreelistCount(),
-      lastVacuumAt: null,
+      lastVacuumAt:
+        vacuumState.lastRunAt !== null ? new Date(vacuumState.lastRunAt).toISOString() : null,
       lastOptimizationAt: null,
       integrityCheck: getIntegrityCheck(),
     },
@@ -225,17 +267,27 @@ export function updateDatabaseSettings(
   updates: Partial<UserDatabaseSettings>
 ): UserDatabaseSettings {
   const nextSettings = getUserDatabaseSettings();
+  const optimizationUpdated = updates.optimization !== undefined;
 
   for (const section of DATABASE_SETTINGS_SECTIONS) {
     if (updates[section] !== undefined) {
       mergeSectionObject(nextSettings, section, updates[section]);
     }
   }
+  normalizeOptimizationSettings(nextSettings);
 
   const db = getDbInstance();
   const insert = db.prepare(
     "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)"
   );
+  const settingsInsert = db.prepare(
+    "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('settings', ?, ?)"
+  );
+
+  const requestedLogs = updates.logs as Partial<UserDatabaseSettings["logs"]> | undefined;
+  const pipelineEnabled = requestedLogs?.callLogPipelineEnabled;
+  const detailedEnabled = requestedLogs?.detailedLogsEnabled;
+
   const tx = db.transaction(() => {
     for (const section of DATABASE_SETTINGS_SECTIONS) {
       const sectionValues = nextSettings[section] as Record<string, unknown>;
@@ -244,11 +296,19 @@ export function updateDatabaseSettings(
         insert.run(DATABASE_SETTINGS_NAMESPACE, `${section}.${key}`, JSON.stringify(value));
       }
     }
+
+    if (pipelineEnabled !== undefined) {
+      settingsInsert.run("call_log_pipeline_enabled", JSON.stringify(Boolean(pipelineEnabled)));
+    }
   });
   tx();
 
   backupDbFile("pre-write");
   invalidateDbCache("settings");
+  if (optimizationUpdated) {
+    applyDatabaseOptimizationSettings(nextSettings.optimization);
+    refreshVacuumScheduler();
+  }
 
   return nextSettings;
 }

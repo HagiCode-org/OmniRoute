@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import Link from "next/link";
 import { useTranslations } from "next-intl";
 import { Card, Button, Input, Toggle } from "@/shared/components";
 
@@ -36,6 +37,29 @@ export default function CliproxyapiSettingsTab() {
   const [message, setMessage] = useState<{ type: string; text: string } | null>(null);
   const [toolState, setToolState] = useState<VersionManagerEntry | null>(null);
   const [toolStateError, setToolStateError] = useState<string | null>(null);
+  // #1934: import CLIProxyAPI auth files (~/.cli-proxy-api/) as OmniRoute connections.
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<string | null>(null);
+
+  const handleImportAuth = useCallback(async () => {
+    setImporting(true);
+    setImportResult(null);
+    try {
+      const res = await fetch("/api/oauth/cliproxy-import", { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        setImportResult(
+          `Imported ${data.imported ?? 0} account(s) (scanned ${data.scanned ?? 0}, skipped ${data.skipped ?? 0}).`
+        );
+      } else {
+        setImportResult(data.error || "Import failed.");
+      }
+    } catch {
+      setImportResult("Import failed.");
+    } finally {
+      setImporting(false);
+    }
+  }, []);
 
   useEffect(() => {
     fetch("/api/settings")
@@ -120,6 +144,21 @@ export default function CliproxyapiSettingsTab() {
 
   return (
     <div className="space-y-4">
+      {/* Migration banner — new lifecycle management lives in the Services page */}
+      <div className="flex items-start gap-2 px-3 py-2.5 rounded-lg bg-blue-500/10 text-blue-700 dark:text-blue-300 text-xs">
+        <span className="material-symbols-outlined text-[14px] mt-0.5 shrink-0">info</span>
+        <span>
+          CLIProxyAPI lifecycle management (install, start, stop) has moved to{" "}
+          <Link
+            href="/dashboard/providers/services"
+            className="underline underline-offset-2 hover:opacity-80"
+          >
+            Providers → Services
+          </Link>
+          . Fallback routing settings below remain here.
+        </span>
+      </div>
+
       {message && (
         <div
           className={`flex items-center gap-2 px-3 py-2 rounded-lg text-xs ${
@@ -243,6 +282,19 @@ export default function CliproxyapiSettingsTab() {
         ) : (
           <p className="text-sm text-text-muted">{t("cliproxyapiNotDetected")}</p>
         )}
+      </Card>
+
+      <Card padding="md">
+        <h3 className="text-lg font-semibold mb-1">{t("cliproxyapiImportAuthTitle")}</h3>
+        <p className="text-sm text-text-muted mb-3">{t("cliproxyapiImportAuthDesc")}</p>
+        <Button onClick={handleImportAuth} loading={importing} disabled={importing}>
+          {t("cliproxyapiImportAuthButton")}
+        </Button>
+        {importResult ? (
+          <p className="text-sm text-text-muted mt-3" role="status">
+            {importResult}
+          </p>
+        ) : null}
       </Card>
     </div>
   );

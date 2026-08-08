@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import fs from "fs/promises";
 import path from "path";
-import os from "os";
 import { z } from "zod";
 import { requireCliToolsAuth } from "@/lib/api/requireCliToolsAuth";
 import { getCliPrimaryConfigPath } from "@/shared/services/cliRuntime";
@@ -10,6 +9,7 @@ import {
   generateHermesAgentConfig,
   getCurrentHermesAgentRoles,
 } from "@/lib/cli-helper/config-generator/hermes-agent";
+import { getHermesConfigPath } from "@/lib/cli-helper/config-generator/hermesHome";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 
 const hermesAgentSettingsSchema = z.object({
@@ -24,6 +24,7 @@ const hermesAgentSettingsSchema = z.object({
       })
     )
     .min(1, "selections must be a non-empty array of { role, model }"),
+  preview: z.boolean().optional(),
 });
 
 /**
@@ -34,7 +35,8 @@ const hermesAgentSettingsSchema = z.object({
  * POST -> accepts { baseUrl, keyId?, apiKey?, selections: [{role, model}, ...] }
  */
 
-const CONFIG_PATH = path.join(os.homedir(), ".hermes", "config.yaml");
+// Resolved lazily so HERMES_HOME is always honoured (#3628).
+const getConfigPath = () => getHermesConfigPath();
 
 function getMetadataPath(configPath: string) {
   return path.join(path.dirname(configPath), ".first-setup.json");
@@ -47,7 +49,7 @@ export async function GET(request: Request) {
   try {
     const roles = await getCurrentHermesAgentRoles();
 
-    const configPath = getCliPrimaryConfigPath("hermes-agent") || CONFIG_PATH;
+    const configPath = getCliPrimaryConfigPath("hermes-agent") || getConfigPath();
     let firstSetupAt: string | null = null;
 
     try {
@@ -86,13 +88,13 @@ export async function POST(request: Request) {
     );
   }
 
-  const { baseUrl, keyId, apiKey, selections } = parsed.data;
+  const { baseUrl, keyId, apiKey, selections, preview } = parsed.data;
 
   if (!validateBaseUrl(baseUrl)) {
     return NextResponse.json({ error: "baseUrl must be a valid http(s) URL" }, { status: 400 });
   }
 
-  const configPath = getCliPrimaryConfigPath("hermes-agent") || CONFIG_PATH;
+  const configPath = getCliPrimaryConfigPath("hermes-agent") || getConfigPath();
   const configDir = path.dirname(configPath);
 
   await fs.mkdir(configDir, { recursive: true });
@@ -111,7 +113,7 @@ export async function POST(request: Request) {
   }
 
   // Preview mode: return the would-be YAML without writing it (Phase 5 polish)
-  if (body.preview === true) {
+  if (preview === true) {
     return NextResponse.json({
       success: true,
       preview: true,

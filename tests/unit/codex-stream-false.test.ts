@@ -4,6 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { OMNIROUTE_RESPONSE_HEADERS } from "../../src/shared/constants/headers.ts";
+
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-codex-stream-false-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
 
@@ -26,6 +28,17 @@ function noopLog() {
 function createComboLog() {
   const entries = [];
   return {
+    info: (tag, msg) => entries.push({ level: "info", tag, msg }),
+    warn: (tag, msg) => entries.push({ level: "warn", tag, msg }),
+    error: (tag, msg) => entries.push({ level: "error", tag, msg }),
+    entries,
+  };
+}
+
+function createCaptureLog() {
+  const entries = [];
+  return {
+    debug: (tag, msg) => entries.push({ level: "debug", tag, msg }),
     info: (tag, msg) => entries.push({ level: "info", tag, msg }),
     warn: (tag, msg) => entries.push({ level: "warn", tag, msg }),
     error: (tag, msg) => entries.push({ level: "error", tag, msg }),
@@ -142,6 +155,7 @@ async function invokeChatCore({
   endpoint = "/v1/chat/completions",
   accept = "application/json",
   responseFactory,
+  log = noopLog(),
 } = {}) {
   const calls = [];
 
@@ -170,7 +184,7 @@ async function invokeChatCore({
         accessToken: "codex-token",
         providerSpecificData: {},
       },
-      log: noopLog(),
+      log,
       clientRawRequest: {
         endpoint,
         body: structuredClone(body),
@@ -199,14 +213,14 @@ test.after(async () => {
 test("CodexExecutor.transformRequest clones the request body before forcing stream=true", () => {
   const executor = new CodexExecutor();
   const body = {
-    model: "gpt-5.4",
+    model: "gpt-5.6-sol",
     input: [{ role: "user", content: [{ type: "input_text", text: "Oi" }] }],
     stream: false,
     reasoning: { effort: "low" },
   };
   const original = structuredClone(body);
 
-  const transformed = executor.transformRequest("gpt-5.4", body, false, {
+  const transformed = executor.transformRequest("gpt-5.6-sol", body, false, {
     requestEndpointPath: "/responses",
   });
 
@@ -238,6 +252,44 @@ test("chatCore converts Responses-style SSE fallback into JSON when stream=false
   assert.ok(payload.usage.completion_tokens > 0);
 });
 
+test("chatCore buffers expected Codex upstream SSE without warning for stream=false clients", async () => {
+  const log = createCaptureLog();
+  const { result, call } = await invokeChatCore({
+    body: {
+      model: "gpt-5.3-codex",
+      stream: false,
+      messages: [{ role: "user", content: "Qual a capital do Brasil?" }],
+    },
+    provider: "codex",
+    model: "gpt-5.3-codex",
+    responseFactory: () => buildResponsesSse("Brasilia"),
+    log,
+  });
+
+  const payload = (await result.response.json()) as any;
+
+  assert.equal(result.success, true);
+  assert.equal(call.headers.Accept || call.headers.accept, "text/event-stream");
+  assert.equal(call.body.stream, true);
+  assert.equal(payload.choices[0].message.content, "Brasilia");
+  assert.equal(
+    log.entries.some(
+      (entry) =>
+        entry.level === "warn" &&
+        String(entry.msg).includes("Unexpected SSE response for non-streaming request")
+    ),
+    false
+  );
+  assert.equal(
+    log.entries.some(
+      (entry) =>
+        entry.level === "debug" &&
+        String(entry.msg).includes("Buffering upstream SSE response for non-streaming client")
+    ),
+    true
+  );
+});
+
 test("chatCore converts Responses-style NDJSON fallback into JSON when stream=false", async () => {
   const { result, call } = await invokeChatCore({
     body: {
@@ -262,7 +314,7 @@ test("chatCore converts Responses-style NDJSON fallback into JSON when stream=fa
 test("handleComboChat validates non-stream quality using the original client stream intent", async () => {
   const combo = {
     name: "codex-stream-false-quality",
-    models: ["codex/gpt-5.4", "openai/gpt-4o-mini"],
+    models: ["codex/gpt-5.6-sol", "openai/gpt-4o-mini"],
   };
   const log = createComboLog();
   const seenModels = [];
@@ -275,7 +327,7 @@ test("handleComboChat validates non-stream quality using the original client str
     combo,
     handleSingleModel: async (requestBody, modelStr) => {
       seenModels.push(modelStr);
-      if (modelStr === "codex/gpt-5.4") {
+      if (modelStr === "codex/gpt-5.6-sol") {
         requestBody.stream = true;
         return jsonResponse({
           choices: [
@@ -303,7 +355,7 @@ test("handleComboChat validates non-stream quality using the original client str
   const payload = (await result.json()) as any;
 
   assert.equal(result.ok, true);
-  assert.deepEqual(seenModels, ["codex/gpt-5.4", "openai/gpt-4o-mini"]);
+  assert.deepEqual(seenModels, ["codex/gpt-5.6-sol", "openai/gpt-4o-mini"]);
   assert.equal(payload.choices[0].message.content, "Brasilia");
   assert.ok(
     log.entries.some(
@@ -314,4 +366,50 @@ test("handleComboChat validates non-stream quality using the original client str
         )
     )
   );
+});
+
+test("non-stream chat success carries cost-telemetry meta headers (cost/version/tokens)", async () => {
+  // Regression guard: the single non-stream success return in chatCore.ts routes
+  // through attachOmniRouteMetaHeaders, which must always emit the cost-telemetry
+  // headers. A usage-bearing JSON upstream body proves real usage flowed through.
+  const { result } = await invokeChatCore({
+    body: {
+      model: "gpt-4o-mini",
+      stream: false,
+      messages: [{ role: "user", content: "Qual a capital do Brasil?" }],
+    },
+    provider: "openai",
+    model: "gpt-4o-mini",
+    responseFactory: () =>
+      jsonResponse({
+        id: "chatcmpl-cost-header",
+        object: "chat.completion",
+        model: "gpt-4o-mini",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "Brasilia" },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+      }),
+  });
+
+  assert.equal(result.success, true);
+
+  const headers = result.response.headers;
+
+  const cost = headers.get(OMNIROUTE_RESPONSE_HEADERS.responseCost);
+  assert.equal(typeof cost, "string");
+  // 10-decimal cost format; 0.0000000000 is valid when no pricing is available.
+  assert.match(String(cost), /^\d+\.\d{10}$/);
+
+  const version = headers.get(OMNIROUTE_RESPONSE_HEADERS.version);
+  assert.equal(typeof version, "string");
+  assert.ok(String(version).length > 0);
+
+  // Real usage from the upstream body must surface as token-count headers.
+  assert.equal(headers.get(OMNIROUTE_RESPONSE_HEADERS.tokensIn), "10");
+  assert.equal(headers.get(OMNIROUTE_RESPONSE_HEADERS.tokensOut), "5");
 });

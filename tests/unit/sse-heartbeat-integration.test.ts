@@ -71,9 +71,9 @@ test("integration: anthropic-ping heartbeat reaches downstream and does NOT trig
       break;
     }
   }
+  assert.equal(sawPing, true);
 
   await reader.cancel();
-  assert.ok(sawPing, "expected to receive at least one event: ping heartbeat within 200ms");
 });
 
 test("integration: openai-chunk heartbeat is valid JSON parseable by SDKs", async () => {
@@ -112,13 +112,13 @@ test("integration: openai-chunk heartbeat is valid JSON parseable by SDKs", asyn
       break;
     }
   }
+  assert.equal(sawValidChunk, true);
 
   await reader.cancel();
-  assert.ok(sawValidChunk, "expected to receive a valid openai-chunk heartbeat within 200ms");
 });
 
 test("integration: shapeForClientFormat + createSseHeartbeatTransform pipeline (claude path)", async () => {
-  // Simulates what chatCore.ts does at line 4276
+  // Simulates what chatCore.ts does
   const shape = shapeForClientFormat("claude");
   assert.equal(shape, HEARTBEAT_SHAPES.ANTHROPIC_PING);
 
@@ -136,6 +136,6 @@ test("integration: shapeForClientFormat + createSseHeartbeatTransform pipeline (
   const reader = upstream.pipeThrough(transform).getReader();
   await reader.read(); // first real
   const { value } = await readWithTimeout(reader);
-  assert.match(decodeChunk(value), /^event: ping\ndata: \{\}\n\n$/);
+  assert.match(decodeChunk(value), /^event: ping\ndata: \{"type":"ping"\}\n\n$/);
   await reader.cancel();
 });

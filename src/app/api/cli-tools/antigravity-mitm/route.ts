@@ -9,6 +9,7 @@ import { cliMitmStartSchema, cliMitmStopSchema } from "@/shared/validation/schem
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { resolveApiKey } from "@/shared/services/apiKeyResolver";
 import { isRoot } from "@/mitm/systemCommands";
+import { isSudoPasswordRequired } from "@/mitm/dns/dnsConfig";
 
 // GET - Check MITM status
 export async function GET(request) {
@@ -18,12 +19,21 @@ export async function GET(request) {
   try {
     const { getMitmStatus, getCachedPassword } = await import("@/mitm/manager.runtime");
     const status = await getMitmStatus();
+    const isWin = process.platform === "win32";
+    const hasCachedPassword = !!getCachedPassword();
+    // Probe sudo availability so the UI can hide the password modal on hosts
+    // where it's unnecessary (Windows, root user, NOPASSWD sudoers, minimal
+    // containers without sudo). MITM elevation is decided by the server OS,
+    // not by the browser's user agent — see PR title.
+    const needsSudoPassword = !isWin && !hasCachedPassword && isSudoPasswordRequired();
     return NextResponse.json({
       running: status.running,
       pid: status.pid || null,
       dnsConfigured: status.dnsConfigured || false,
       certExists: status.certExists || false,
-      hasCachedPassword: !!getCachedPassword(),
+      hasCachedPassword,
+      isWin,
+      needsSudoPassword,
     });
   } catch (error) {
     console.log("Error getting MITM status:", sanitizeErrorMessage(error));
@@ -56,25 +66,30 @@ export async function POST(request) {
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
-    const { apiKey: rawApiKey, sudoPassword } = validation.data;
-    // (#523) Extract keyId BEFORE validation — Zod strips unknown fields!
-    const apiKeyId = typeof rawBody?.keyId === "string" ? rawBody.keyId.trim() : null;
+    const { apiKey: rawApiKey, keyId: rawKeyId, sudoPassword } = validation.data;
+    const apiKeyId = rawKeyId ?? null;
     const apiKey = await resolveApiKey(apiKeyId, rawApiKey);
+    if (!apiKey || apiKey === "sk_omniroute") {
+      return NextResponse.json(
+        { error: "Missing apiKey: provide a valid apiKey or a resolvable keyId" },
+        { status: 400 }
+      );
+    }
     const { startMitm, getCachedPassword, setCachedPassword } =
       await import("@/mitm/manager.runtime");
     const isWin = process.platform === "win32";
     const isRootUser = !isWin && isRoot();
     const pwd = sudoPassword || getCachedPassword() || "";
 
-    if (!apiKey || (!isWin && !pwd && !isRootUser)) {
-      return NextResponse.json(
-        { error: isWin ? "Missing apiKey" : "Missing apiKey or sudoPassword" },
-        { status: 400 }
-      );
+    // Require a sudo password only when the OS actually needs one. Skips the
+    // prompt on Windows (UAC), root, NOPASSWD sudoers, and minimal containers
+    // without sudo on PATH (#822).
+    if (!isWin && !pwd && !isRootUser && isSudoPasswordRequired()) {
+      return NextResponse.json({ error: "Missing sudoPassword" }, { status: 400 });
     }
 
     const result = await startMitm(apiKey, pwd);
-    if (!isWin) setCachedPassword(pwd);
+    if (!isWin && pwd) setCachedPassword(pwd);
 
     return NextResponse.json({
       success: true,
@@ -122,7 +137,10 @@ export async function DELETE(request) {
     const isRootUser = !isWin && isRoot();
     const pwd = sudoPassword || getCachedPassword() || "";
 
-    if (!isWin && !pwd && !isRootUser) {
+    // Require a sudo password only when the OS actually needs one. Skips the
+    // prompt on Windows (UAC), root, NOPASSWD sudoers, and minimal containers
+    // without sudo on PATH (#822).
+    if (!isWin && !pwd && !isRootUser && isSudoPasswordRequired()) {
       return NextResponse.json({ error: "Missing sudoPassword" }, { status: 400 });
     }
 

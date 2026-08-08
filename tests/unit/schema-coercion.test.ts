@@ -4,6 +4,8 @@ import {
   coerceSchemaNumericFields,
   coerceToolSchemas,
   injectEmptyReasoningContentForToolCalls,
+  injectOptionalEnumOmissionForTools,
+  injectOptionalEnumOmissionSentinel,
   sanitizeToolDescription,
   sanitizeToolDescriptions,
 } from "../../open-sse/translator/helpers/schemaCoercion.ts";
@@ -170,9 +172,7 @@ test("injectEmptyReasoningContentForToolCalls supports all reasoning replay prov
   const reasoningProviders = [
     { provider: "deepseek", model: "deepseek-chat" },
     { provider: "opencode-go", model: "some-model" },
-    { provider: "siliconflow", model: "deepseek-r1" },
     { provider: "nebius", model: "qwq-32b" },
-    { provider: "deepinfra", model: "deepseek-reasoner" },
     { provider: "sambanova", model: "qwen3-thinking" },
     { provider: "fireworks", model: "glm-5-thinking" },
     { provider: "together", model: "mimo-v2.5" },
@@ -200,6 +200,8 @@ test("injectEmptyReasoningContentForToolCalls skips non-reasoning models", () =>
     { provider: "anthropic", model: "claude-sonnet-4" },
     { provider: "google", model: "gemini-pro" },
     { provider: "groq", model: "llama-3" },
+    { provider: "siliconflow", model: "deepseek-r1" },
+    { provider: "deepinfra", model: "deepseek-reasoner" },
   ];
 
   for (const { provider, model } of nonReasoningModels) {
@@ -213,4 +215,57 @@ test("injectEmptyReasoningContentForToolCalls skips non-reasoning models", () =>
       `should NOT inject reasoning_content for ${provider}/${model}`
     );
   }
+});
+
+// #7023 — optional-enum null-omission sentinel
+test("injectOptionalEnumOmissionSentinel: no-op on non-object schema", () => {
+  assert.strictEqual(injectOptionalEnumOmissionSentinel(null), null);
+  assert.strictEqual(injectOptionalEnumOmissionSentinel("not-a-schema"), "not-a-schema");
+});
+
+test("injectOptionalEnumOmissionSentinel: no-op when schema has no properties", () => {
+  const schema = { type: "object" };
+  assert.deepStrictEqual(injectOptionalEnumOmissionSentinel(schema), schema);
+});
+
+test("injectOptionalEnumOmissionSentinel: preserves an already-present null in enum without duplicating", () => {
+  const schema = {
+    type: "object",
+    properties: { mode: { type: ["string", "null"], enum: ["a", "b", null] } },
+    required: [],
+  };
+  const result = injectOptionalEnumOmissionSentinel(schema) as {
+    properties: { mode: { enum: unknown[] } };
+  };
+  assert.deepStrictEqual(result.properties.mode.enum, ["a", "b", null]);
+});
+
+test("injectOptionalEnumOmissionForTools: non-array input passed through unchanged", () => {
+  assert.strictEqual(injectOptionalEnumOmissionForTools(null), null);
+  assert.strictEqual(injectOptionalEnumOmissionForTools(undefined), undefined);
+});
+
+test("injectOptionalEnumOmissionForTools: Chat Completions {function:{parameters}} shape is left untouched", () => {
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "Agent",
+        parameters: {
+          type: "object",
+          properties: { isolation: { type: "string", enum: ["worktree", "remote"] } },
+          required: [],
+        },
+      },
+    },
+  ];
+  const result = injectOptionalEnumOmissionForTools(tools) as Array<{
+    function: { parameters: { properties: { isolation: { enum: unknown[] } } } };
+  }>;
+  // Chat Completions shape (nested under `.function`) is out of scope for this
+  // Responses-API-only injector — assert it is not mutated.
+  assert.deepStrictEqual(
+    result[0].function.parameters.properties.isolation.enum,
+    ["worktree", "remote"]
+  );
 });

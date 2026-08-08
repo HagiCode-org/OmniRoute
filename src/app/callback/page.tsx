@@ -16,7 +16,9 @@ import { useEffect, useState } from "react";
  */
 export default function CallbackPage() {
   const [status, setStatus] = useState<"processing" | "success" | "done" | "manual">("processing");
-  const [currentUrl, setCurrentUrl] = useState("");
+  const [currentUrl] = useState(() =>
+    typeof window === "undefined" ? "" : window.location.href
+  );
   const t = useTranslations("auth");
 
   useEffect(() => {
@@ -35,20 +37,46 @@ export default function CallbackPage() {
     };
 
     let sent = false;
+    let openerSameOrigin = false;
+    const queueStatusUpdate = (nextStatus: "processing" | "success" | "done" | "manual") => {
+      queueMicrotask(() => setStatus(nextStatus));
+    };
+
+    if (window.opener) {
+      try {
+        openerSameOrigin = window.opener.location.origin === window.location.origin;
+      } catch {
+        openerSameOrigin = false;
+      }
+    }
 
     // Method 1: postMessage to opener (popup mode).
     // May be null when Google OAuth's COOP header severs the opener reference.
+    //
+    // Only relay {code, state} to a known-trusted target origin. A wildcard "*"
+    // here would leak the OAuth code/state to a hostile opener — e.g. a page
+    // that opened this callback URL in a popup to phish the code. The browser
+    // delivers postMessage only when the opener's origin matches `targetOrigin`,
+    // so iterating over an allowlist lets the same-origin parent and Codex's
+    // fixed loopback helper receive it while silently dropping it for any other
+    // origin. Methods 2 (BroadcastChannel) and 3 (localStorage) cover the
+    // same-origin fallback when the opener was severed by COOP.
+    const trustedTargetOrigins = [
+      window.location.origin, // Same origin (dashboard popup mode).
+      "http://localhost:1455", // Codex helper (fixed loopback port).
+      "http://127.0.0.1:1455", // Same Codex helper, IPv4 literal form.
+    ];
     if (window.opener) {
-      try {
-        // Target this origin specifically — popup mode is only used when isTrueLocalhost,
-        // so the opener is always on the same origin as the callback page.
-        window.opener.postMessage(
-          { type: "oauth_callback", data: callbackData },
-          window.location.origin
-        );
-        sent = true;
-      } catch (e) {
-        console.log("postMessage failed:", e);
+      for (const origin of trustedTargetOrigins) {
+        try {
+          window.opener.postMessage(
+            { type: "oauth_callback", data: callbackData },
+            origin
+          );
+          sent = true;
+        } catch (e) {
+          console.log("postMessage failed:", e);
+        }
       }
     }
 
@@ -75,28 +103,28 @@ export default function CallbackPage() {
     }
 
     if (sent && (code || error)) {
-      if (window.opener) {
-        // eslint-disable-next-line react-hooks/set-state-in-effect -- initialization effect, window-only
-        setStatus("success");
+      if (window.opener && openerSameOrigin) {
+        queueStatusUpdate("success");
         setTimeout(() => {
           window.close();
           // If close is prevented (browser policy), fall through to manual close prompt.
           setTimeout(() => setStatus("done"), 500);
         }, 1500);
       } else {
-        // Opened as new tab or opener severed by COOP — show close prompt.
-        setStatus("done");
+        // Opened as a tab, opener severed by COOP, or remote dashboard using a
+        // loopback/tunnel callback. Keep the full URL visible as a manual fallback
+        // in case the opener cannot receive the cross-origin postMessage.
+        queueStatusUpdate("manual");
       }
     } else {
       // No code/error in URL or all send methods failed — show URL for manual copy.
       // Batch the URL and status update so they render together (React 18 auto-batching).
-      setCurrentUrl(window.location.href);
-      setStatus("manual");
+      queueStatusUpdate("manual");
     }
   }, []);
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-bg">
+    <div className="min-h-screen flex items-center justify-center">
       <div className="text-center p-8 max-w-md">
         {status === "processing" && (
           <>

@@ -52,7 +52,7 @@ test("DEFAULT_CC_BRIDGE_PIPELINE places billing header at [0] and identity at [1
     DEFAULT_CC_BRIDGE_PIPELINE
   );
   const blocks = result.body.system as any[];
-  assert.ok(blocks[0].text.startsWith("x-anthropic-billing-header:"));
+  assert.ok(blocks[0].text.startsWith("x-anthropic-billing-header: cc_version=2.1.219.250;"));
   assert.equal(blocks[1].text, CLAUDE_AGENT_SDK_IDENTITY);
 });
 
@@ -322,7 +322,7 @@ test("buildBillingHeaderValue produces the expected ex-machina format", () => {
   });
   assert.match(
     value,
-    /^x-anthropic-billing-header: cc_version=2\.1\.146\.[0-9a-f]{3}; cc_entrypoint=sdk-cli; cch=[0-9a-f]{5};$/
+    /^x-anthropic-billing-header: cc_version=\d+\.\d+\.\d+\.[0-9a-f]{3}; cc_entrypoint=sdk-cli; cch=[0-9a-f]{5};$/
   );
 });
 

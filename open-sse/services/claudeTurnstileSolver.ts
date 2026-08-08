@@ -10,7 +10,11 @@
  * 6. Returns fresh cookie for tls-client-node
  */
 
-import { chromium, type Browser, type Page } from "playwright";
+import type { Browser, Page } from "playwright";
+import {
+  CLAUDE_WEB_FINGERPRINT,
+  CLAUDE_WEB_FINGERPRINT_VERSION,
+} from "../config/claudeWebFingerprint.ts";
 
 const CLAUDE_WEB_URL = "https://claude.ai";
 const CHALLENGE_TIMEOUT = 60000; // 60s to solve challenge
@@ -80,13 +84,14 @@ export async function solveTurnstile(options?: {
   let page: Page | null = null;
 
   try {
-    // Launch headless browser
+    // Launch headless browser (lazy import — avoids crashing platforms
+    // playwright-core doesn't support, e.g. Termux/Android, on module load)
+    const { chromium } = await import("playwright");
     browser = await chromium.launch({ headless });
     const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      userAgent: CLAUDE_WEB_FINGERPRINT.userAgent,
       viewport: { width: 1280, height: 720 },
-      ignoreHTTPSErrors: true,
+      ignoreHTTPSErrors: process.env.OMNIROUTE_TURNSTILE_IGNORE_TLS_ERRORS === "true",
     });
 
     page = await context.newPage();
@@ -134,6 +139,12 @@ const tokenCache = new Map<
   }
 >();
 
+let cfClearanceTokenOverride: string | null = null;
+
+export function setCfClearanceTokenForTesting(token: string | null): void {
+  cfClearanceTokenOverride = token;
+}
+
 /**
  * Get or solve cf_clearance (with caching)
  */
@@ -141,8 +152,16 @@ export async function getCfClearanceToken(options?: {
   force?: boolean;
   headless?: boolean;
 }): Promise<string> {
-  const cacheKey = "claude-cf-clearance";
+  const cacheKey = `claude-cf-clearance-${CLAUDE_WEB_FINGERPRINT_VERSION}`;
   const cached = tokenCache.get(cacheKey);
+
+  if (cfClearanceTokenOverride) {
+    tokenCache.set(cacheKey, {
+      token: cfClearanceTokenOverride,
+      expiresAt: Date.now() + 55 * 60 * 1000,
+    });
+    return cfClearanceTokenOverride;
+  }
 
   // Return cached token if still valid (5 min buffer)
   if (cached && !options?.force && cached.expiresAt > Date.now() + 5 * 60 * 1000) {
@@ -177,7 +196,7 @@ export function getCacheStatus(): {
   hasCached: boolean;
   expiresIn?: number;
 } {
-  const cacheKey = "claude-cf-clearance";
+  const cacheKey = `claude-cf-clearance-${CLAUDE_WEB_FINGERPRINT_VERSION}`;
   const cached = tokenCache.get(cacheKey);
 
   if (!cached) {

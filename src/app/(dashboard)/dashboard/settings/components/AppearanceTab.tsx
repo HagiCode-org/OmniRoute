@@ -1,7 +1,6 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import Link from "next/link";
 import { Button, Card, Toggle } from "@/shared/components";
 import { useTheme } from "@/shared/hooks/useTheme";
 import useThemeStore, { COLOR_THEMES } from "@/store/themeStore";
@@ -13,6 +12,8 @@ import {
   normalizeComboConfigMode,
   type ComboConfigMode,
 } from "@/shared/constants/comboConfigMode";
+import { PIN_PROVIDER_QUOTA_TO_HOME_KEY } from "@/shared/constants/homeWidgets";
+import AccountEmailVisibilitySetting from "./AccountEmailVisibilitySetting";
 
 export default function AppearanceTab() {
   const { theme, setTheme, isDark } = useTheme();
@@ -29,11 +30,23 @@ export default function AppearanceTab() {
   }, [isElectron]);
   const [settings, setSettings] = useState<Record<string, any>>({});
   const [loading, setLoading] = useState(true);
-  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadError, setUploadError] = useState<{
+    target: "logo" | "favicon";
+    message: string;
+  } | null>(null);
   const [customThemeColor, setCustomThemeColor] = useState(customColor || "#3b82f6");
   const isValidHex = /^#([0-9a-fA-F]{6})$/.test(
     customThemeColor.startsWith("#") ? customThemeColor : `#${customThemeColor}`
   );
+  const pinProviderQuotaToHome = settings.pinProviderQuotaToHome === true;
+  const showQuickStartOnHome = settings.showQuickStartOnHome !== false;
+  const showProviderTopologyOnHome = settings.showProviderTopologyOnHome !== false;
+  const autoRefreshProviderQuota = settings.autoRefreshProviderQuota === true;
+  const autoRefreshProviderQuotaInterval = Number.isFinite(
+    settings.autoRefreshProviderQuotaInterval
+  )
+    ? Number(settings.autoRefreshProviderQuotaInterval)
+    : 180;
   const comboConfigMode = normalizeComboConfigMode(settings[COMBO_CONFIG_MODE_SETTING_KEY]);
   const showCloudflaredTunnel = settings.hideEndpointCloudflaredTunnel !== true;
   const showTailscaleFunnel = settings.hideEndpointTailscaleFunnel !== true;
@@ -123,6 +136,10 @@ export default function AppearanceTab() {
     },
   ];
 
+  const quotaRefreshInterval = Number.isFinite(autoRefreshProviderQuotaInterval)
+    ? Math.min(3600, Math.max(10, Math.floor(autoRefreshProviderQuotaInterval)))
+    : 180;
+
   return (
     <Card>
       <div className="flex items-center gap-3 mb-4">
@@ -171,54 +188,76 @@ export default function AppearanceTab() {
         </div>
 
         <div className="pt-4 border-t border-border">
-          <p className="font-medium mb-1">{t("themeAccent")}</p>
-          <p className="text-sm text-text-muted mb-3">{t("themeAccentDesc")}</p>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3">
-            {presetThemes.map((item) => {
-              const active = colorTheme === item.id;
-              return (
-                <button
-                  key={item.id}
-                  onClick={() => setColorTheme(item.id)}
-                  className={cn(
-                    "flex items-center justify-between gap-2 p-2 rounded-lg border transition-colors",
-                    active
-                      ? "border-primary bg-primary/10 text-primary"
-                      : "border-border hover:bg-surface/50 text-text-main"
-                  )}
-                >
-                  <span className="flex items-center gap-2">
-                    <span
-                      className="size-4 rounded-full border border-black/10 dark:border-white/20"
-                      style={{ backgroundColor: item.color }}
-                    />
-                    <span className="text-sm font-medium">{item.label}</span>
-                  </span>
-                </button>
-              );
-            })}
+          <div className="mb-3">
+            <p className="font-medium">
+              {getSettingsLabel("homePinProviderQuotaToHome", "Pin Information to Home Page")}
+            </p>
+            <p className="text-sm text-text-muted">{t("homePinnedSectionsDesc")}</p>
           </div>
 
-          <div className="flex items-center gap-2">
-            <input
-              type="color"
-              value={customThemeColor}
-              onChange={(e) => setCustomThemeColor(e.target.value)}
-              className="h-10 w-12 rounded border border-border bg-surface cursor-pointer"
-              aria-label={t("themeCustom")}
-            />
-            <input
-              type="text"
-              value={customThemeColor}
-              onChange={(e) => setCustomThemeColor(e.target.value)}
-              placeholder="#3b82f6"
-              maxLength={7}
-              className={`flex-1 h-10 px-3 rounded-lg bg-surface border text-sm text-text-main focus:outline-none ${isValidHex ? "border-border focus:border-primary" : "border-red-400 focus:border-red-500"}`}
-            />
-            <Button onClick={() => setCustomColorTheme(customThemeColor)} disabled={!isValidHex}>
-              {t("themeCreate")}
-            </Button>
+          <div className="rounded-lg border border-border bg-surface/40 overflow-hidden">
+            <div className="divide-y divide-border/70">
+              <div className="flex items-start justify-between gap-4 px-4 py-3">
+                <div>
+                  <p className="font-medium">
+                    {getSettingsLabel("homeProviderQuotaLimits", "Provider Quota Limits")}
+                  </p>
+                  <p className="text-sm text-text-muted">
+                    {getSettingsLabel(
+                      "homeProviderQuotaLimitsDesc",
+                      "Pin the Provider Quota status container (with Refresh All button) to the top of the Home page."
+                    )}
+                  </p>
+                </div>
+                <Toggle
+                  checked={pinProviderQuotaToHome}
+                  onChange={async (checked) => {
+                    await updateSetting(PIN_PROVIDER_QUOTA_TO_HOME_KEY, checked);
+                  }}
+                  disabled={loading}
+                />
+              </div>
+
+              <div className="flex items-start justify-between gap-4 px-4 py-3">
+                <div>
+                  <p className="font-medium">{getSettingsLabel("homeQuickStart", "Quick Start")}</p>
+                  <p className="text-sm text-text-muted">
+                    {getSettingsLabel(
+                      "homeQuickStartDesc",
+                      "Show the Quick Start panel on the Home page."
+                    )}
+                  </p>
+                </div>
+                <Toggle
+                  checked={showQuickStartOnHome}
+                  onChange={async (checked) => {
+                    await updateSetting("showQuickStartOnHome", checked);
+                  }}
+                  disabled={loading}
+                />
+              </div>
+
+              <div className="flex items-start justify-between gap-4 px-4 py-3">
+                <div>
+                  <p className="font-medium">
+                    {getSettingsLabel("homeProviderTopology", "Provider Topology")}
+                  </p>
+                  <p className="text-sm text-text-muted">
+                    {getSettingsLabel(
+                      "homeProviderTopologyDesc",
+                      "Show the Provider Topology on the Home page."
+                    )}
+                  </p>
+                </div>
+                <Toggle
+                  checked={showProviderTopologyOnHome}
+                  onChange={async (checked) => {
+                    await updateSetting("showProviderTopologyOnHome", checked);
+                  }}
+                  disabled={loading}
+                />
+              </div>
+            </div>
           </div>
         </div>
 
@@ -349,25 +388,76 @@ export default function AppearanceTab() {
         </div>
 
         <div className="pt-4 border-t border-border">
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <p className="font-medium">{t("sidebarVisibilityToggle")}</p>
-              <p className="text-sm text-text-muted">
-                {getSettingsLabel(
-                  "sidebarCustomizeLink",
-                  "Customize which items appear in the sidebar, their order, and apply role presets."
-                )}
-              </p>
+          <div className="mb-3">
+            <p className="font-medium">
+              {getSettingsLabel("providerQuotaAutoRefresh", "Provider Quota auto refresh")}
+            </p>
+            <p className="text-sm text-text-muted">
+              {getSettingsLabel(
+                "providerQuotaAutoRefreshDesc",
+                "Refresh the Provider Limits view automatically while it stays open."
+              )}
+            </p>
+          </div>
+
+          <div className="rounded-lg border border-border bg-surface/40 divide-y divide-border/70">
+            <div className="flex items-center justify-between gap-4 px-4 py-3">
+              <div>
+                <p className="font-medium">
+                  {getSettingsLabel("providerQuotaAutoRefreshToggle", "Automatic refresh")}
+                </p>
+                <p className="text-sm text-text-muted">
+                  {getSettingsLabel(
+                    "providerQuotaAutoRefreshToggleDesc",
+                    "Refresh the quota view every few minutes while the page is visible."
+                  )}
+                </p>
+              </div>
+              <Toggle
+                checked={autoRefreshProviderQuota}
+                onChange={async (checked) => {
+                  if (checked && !settings.autoRefreshProviderQuotaInterval) {
+                    await updateSetting("autoRefreshProviderQuotaInterval", 180);
+                  }
+                  await updateSetting("autoRefreshProviderQuota", checked);
+                }}
+                disabled={loading}
+              />
             </div>
-            <Link
-              href="/dashboard/settings/sidebar"
-              className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md border border-border hover:bg-surface/80 hover:border-primary/40 transition-colors text-text-main"
-            >
-              <span className="material-symbols-outlined text-[16px]">view_sidebar</span>
-              {getSettingsLabel("sidebarCustomizeLinkBtn", "Customize")}
-            </Link>
+
+            <div className="flex items-center justify-between gap-4 px-4 py-3">
+              <div>
+                <p className="font-medium">
+                  {getSettingsLabel("providerQuotaAutoRefreshInterval", "Refresh interval")}
+                </p>
+                <p className="text-sm text-text-muted">
+                  {getSettingsLabel(
+                    "providerQuotaAutoRefreshIntervalDesc",
+                    "How often the quota view should refresh, in seconds."
+                  )}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  min={10}
+                  max={3600}
+                  step={10}
+                  value={quotaRefreshInterval}
+                  onChange={async (e) => {
+                    const next = Math.min(3600, Math.max(10, Number(e.target.value) || 180));
+                    await updateSetting("autoRefreshProviderQuotaInterval", next);
+                  }}
+                  disabled={loading || !autoRefreshProviderQuota}
+                  className="h-10 w-28 px-3 rounded-lg bg-surface border border-border text-sm text-text-main focus:outline-none focus:border-primary disabled:opacity-50"
+                />
+                <span className="text-xs text-text-muted">{t("seconds")}</span>
+              </div>
+            </div>
           </div>
         </div>
+
+        <AccountEmailVisibilitySetting />
 
         <div className="pt-4 border-t border-border">
           <div className="flex items-center justify-between">
@@ -380,6 +470,58 @@ export default function AppearanceTab() {
               onChange={() => updateSetting("hideHealthCheckLogs", !settings.hideHealthCheckLogs)}
               disabled={loading}
             />
+          </div>
+        </div>
+
+        <div className="pt-4 border-t border-border">
+          <p className="font-medium mb-1">{t("themeAccent")}</p>
+          <p className="text-sm text-text-muted mb-3">{t("themeAccentDesc")}</p>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3">
+            {presetThemes.map((item) => {
+              const active = colorTheme === item.id;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => setColorTheme(item.id)}
+                  className={cn(
+                    "flex items-center justify-between gap-2 p-2 rounded-lg border transition-colors",
+                    active
+                      ? "border-primary bg-primary/10 text-primary"
+                      : "border-border hover:bg-surface/50 text-text-main"
+                  )}
+                >
+                  <span className="flex items-center gap-2">
+                    <span
+                      className="size-4 rounded-full border border-black/10 dark:border-white/20"
+                      style={{ backgroundColor: item.color }}
+                    />
+                    <span className="text-sm font-medium">{item.label}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <input
+              type="color"
+              value={customThemeColor}
+              onChange={(e) => setCustomThemeColor(e.target.value)}
+              className="h-10 w-12 rounded border border-border bg-surface cursor-pointer"
+              aria-label={t("themeCustom")}
+            />
+            <input
+              type="text"
+              value={customThemeColor}
+              onChange={(e) => setCustomThemeColor(e.target.value)}
+              placeholder="#3b82f6"
+              maxLength={7}
+              className={`flex-1 h-10 px-3 rounded-lg bg-surface border text-sm text-text-main focus:outline-none ${isValidHex ? "border-border focus:border-primary" : "border-red-400 focus:border-red-500"}`}
+            />
+            <Button onClick={() => setCustomColorTheme(customThemeColor)} disabled={!isValidHex}>
+              {t("themeCreate")}
+            </Button>
           </div>
         </div>
 
@@ -450,7 +592,7 @@ export default function AppearanceTab() {
                       const file = e.target.files?.[0];
                       if (file) {
                         if (file.size > 500 * 1024) {
-                          setUploadError("Logo file must be less than 500KB");
+                          setUploadError({ target: "logo", message: t("logoFileTooLarge") });
                           return;
                         }
                         const validTypes = [
@@ -461,15 +603,13 @@ export default function AppearanceTab() {
                           "image/webp",
                         ];
                         if (!validTypes.includes(file.type)) {
-                          setUploadError(
-                            "Invalid file type. Please upload PNG, JPG, SVG, GIF, or WebP."
-                          );
+                          setUploadError({ target: "logo", message: t("invalidLogoFileType") });
                           return;
                         }
                         setUploadError(null);
                         const reader = new FileReader();
                         reader.onerror = () => {
-                          setUploadError("Failed to read file");
+                          setUploadError({ target: "logo", message: t("failedToReadFile") });
                         };
                         reader.onload = (event) => {
                           const base64 = event.target?.result as string;
@@ -493,7 +633,9 @@ export default function AppearanceTab() {
                   {t("resetLogo")}
                 </Button>
               </div>
-              {uploadError && <p className="text-sm text-red-500">{uploadError}</p>}
+              {uploadError?.target === "logo" && (
+                <p className="text-sm text-red-500">{uploadError.message}</p>
+              )}
               {(settings.customLogoBase64 || settings.customLogoUrl) && (
                 <div className="mt-2 p-3 bg-black/5 dark:bg-white/5 rounded-lg">
                   <p className="text-xs text-text-muted mb-2">{t("logoPreview")}</p>
@@ -544,7 +686,10 @@ export default function AppearanceTab() {
                       const file = e.target.files?.[0];
                       if (file) {
                         if (file.size > 50 * 1024) {
-                          setUploadError("Favicon file must be less than 50KB");
+                          setUploadError({
+                            target: "favicon",
+                            message: t("faviconFileTooLarge"),
+                          });
                           return;
                         }
                         const validTypes = [
@@ -555,15 +700,16 @@ export default function AppearanceTab() {
                           "image/webp",
                         ];
                         if (!validTypes.includes(file.type)) {
-                          setUploadError(
-                            "Invalid file type. Please upload PNG, ICO, SVG, GIF, or WebP."
-                          );
+                          setUploadError({
+                            target: "favicon",
+                            message: t("invalidFaviconFileType"),
+                          });
                           return;
                         }
                         setUploadError(null);
                         const reader = new FileReader();
                         reader.onerror = () => {
-                          setUploadError("Failed to read file");
+                          setUploadError({ target: "favicon", message: t("failedToReadFile") });
                         };
                         reader.onload = (event) => {
                           const base64 = event.target?.result as string;
@@ -587,8 +733,8 @@ export default function AppearanceTab() {
                   {t("resetFavicon")}
                 </Button>
               </div>
-              {uploadError && !uploadError.includes("Logo") && (
-                <p className="text-sm text-red-500">{uploadError}</p>
+              {uploadError?.target === "favicon" && (
+                <p className="text-sm text-red-500">{uploadError.message}</p>
               )}
               {(settings.customFaviconBase64 || settings.customFaviconUrl) && (
                 <div className="mt-2 p-3 bg-black/5 dark:bg-white/5 rounded-lg">
@@ -605,11 +751,8 @@ export default function AppearanceTab() {
             {isElectron && (
               <div className="flex items-center justify-between pt-4 border-t border-border">
                 <div>
-                  <p className="font-medium">Start on Login</p>
-                  <p className="text-xs text-text-muted mt-0.5">
-                    Automatically launch OmniRoute on system startup and run silently in the
-                    background tray.
-                  </p>
+                  <p className="font-medium">{t("startOnLogin")}</p>
+                  <p className="text-xs text-text-muted mt-0.5">{t("startOnLoginDesc")}</p>
                 </div>
                 <Toggle
                   checked={autostartEnabled}

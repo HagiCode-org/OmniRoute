@@ -5,6 +5,8 @@ import { useTranslations } from "next-intl";
 import Card from "@/shared/components/Card";
 import ProviderIcon from "@/shared/components/ProviderIcon";
 import { USAGE_SUPPORTED_PROVIDERS } from "@/shared/constants/providers";
+import { translateUsageOrFallback } from "../dashboard/usage/components/ProviderLimits/i18nFallback";
+import { isProviderQuotaVisible } from "@/shared/utils/providerQuotaVisibility";
 
 type Connection = {
   id: string;
@@ -12,13 +14,75 @@ type Connection = {
   authType?: string;
   email?: string;
   name?: string;
+  quotaVisible?: boolean;
 };
 
 type QuotaData = Record<string, any>;
 
-export default function ProviderQuotaWidget() {
+interface ProviderQuotaWidgetProps {
+  autoRefreshInterval?: number;
+}
+
+function formatAutoRefreshCountdown(ms: number): string {
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+export function AutoRefreshButtonLabel({
+  autoRefreshIntervalMs,
+  lastRefreshAllAt,
+  refreshingAll,
+  tr,
+}: {
+  autoRefreshIntervalMs: number;
+  lastRefreshAllAt: number;
+  refreshingAll: boolean;
+  tr: (key: string, fallback: string) => string;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (autoRefreshIntervalMs <= 0 || refreshingAll) return;
+
+    const tick = () => setNow(Date.now());
+    tick();
+
+    const timer = window.setInterval(tick, 1000);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") tick();
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [autoRefreshIntervalMs, refreshingAll, lastRefreshAllAt]);
+
+  if (refreshingAll) {
+    return <>{tr("refreshing", "Refreshing")}</>;
+  }
+
+  if (autoRefreshIntervalMs <= 0) {
+    return <>{tr("refreshAll", "Refresh All")}</>;
+  }
+
+  return (
+    <>
+      {tr("autoRefreshing", "Auto-refreshing")}{" "}
+      {formatAutoRefreshCountdown(Math.max(0, autoRefreshIntervalMs - (now - lastRefreshAllAt)))}
+    </>
+  );
+}
+
+export default function ProviderQuotaWidget({ autoRefreshInterval = 0 }: ProviderQuotaWidgetProps) {
   const t = useTranslations("usage");
-  const tc = useTranslations("common");
+  const tr = useCallback(
+    (key: string, fallback: string) => translateUsageOrFallback(t, key, fallback),
+    [t]
+  );
 
   const [connections, setConnections] = useState<Connection[]>([]);
   const [quotaData, setQuotaData] = useState<QuotaData>({});
@@ -26,6 +90,9 @@ export default function ProviderQuotaWidget() {
   const [refreshingAll, setRefreshingAll] = useState(false);
 
   const refreshingAllRef = useRef(false);
+  const lastRefreshAllAtRef = useRef(Date.now());
+  const [lastRefreshAllAt, setLastRefreshAllAt] = useState(() => lastRefreshAllAtRef.current);
+  const autoRefreshIntervalMs = autoRefreshInterval > 0 ? autoRefreshInterval * 1000 : 0;
 
   const fetchConnections = useCallback(async () => {
     try {
@@ -56,6 +123,7 @@ export default function ProviderQuotaWidget() {
     // Only keep connections that are usage/quota supported
     const relevant = conns.filter(
       (c) =>
+        isProviderQuotaVisible(c) &&
         USAGE_SUPPORTED_PROVIDERS.includes(c.provider) &&
         (c.authType === "oauth" || c.authType === "apikey")
     );
@@ -72,6 +140,9 @@ export default function ProviderQuotaWidget() {
   const refreshAll = useCallback(async () => {
     if (refreshingAllRef.current) return;
     refreshingAllRef.current = true;
+    const now = Date.now();
+    lastRefreshAllAtRef.current = now;
+    setLastRefreshAllAt(now);
     setRefreshingAll(true);
 
     try {
@@ -81,22 +152,36 @@ export default function ProviderQuotaWidget() {
         throw new Error(err.error || "Refresh failed");
       }
       const data = await res.json();
-      // Re-fetch connections + caches to get fresh state
-      const [conns, caches] = await Promise.all([fetchConnections(), fetchCached()]);
-      const relevant = conns.filter(
-        (c) =>
-          USAGE_SUPPORTED_PROVIDERS.includes(c.provider) &&
-          (c.authType === "oauth" || c.authType === "apikey")
-      );
-      setConnections(relevant);
-      setQuotaData(caches || data.caches || {});
+      setQuotaData(data.caches || {});
     } catch (e) {
       console.error("ProviderQuotaWidget refreshAll error:", e);
     } finally {
       refreshingAllRef.current = false;
       setRefreshingAll(false);
     }
-  }, [fetchConnections, fetchCached]);
+  }, []);
+
+  useEffect(() => {
+    if (autoRefreshIntervalMs <= 0) return;
+
+    const maybeRefresh = () => {
+      if (document.visibilityState !== "visible") return;
+      if (refreshingAllRef.current) return;
+      if (Date.now() - lastRefreshAllAtRef.current >= autoRefreshIntervalMs) {
+        void refreshAll();
+      }
+    };
+
+    maybeRefresh();
+    const timer = window.setInterval(maybeRefresh, 1000);
+    const handleVisibilityChange = () => maybeRefresh();
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [autoRefreshIntervalMs, refreshAll]);
 
   // Simple summary: group by provider for display
   const providerGroups = connections.reduce<Record<string, Connection[]>>((acc, conn) => {
@@ -116,9 +201,9 @@ export default function ProviderQuotaWidget() {
             account_balance
           </span>
           <div>
-            <h3 className="font-semibold text-base">{t("providerQuota") || "Provider Quota"}</h3>
+            <h3 className="font-semibold text-base">{tr("providerQuota", "Provider Quota")}</h3>
             <p className="text-[11px] text-text-muted -mt-0.5">
-              {t("providerQuotaHomeHint") || "Live status across connected accounts"}
+              {tr("providerQuotaHomeHint", "Live status across connected accounts")}
             </p>
           </div>
         </div>
@@ -127,14 +212,25 @@ export default function ProviderQuotaWidget() {
           onClick={refreshAll}
           disabled={refreshingAll || loading}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-border bg-bg-subtle text-xs font-medium text-text-main disabled:opacity-50 disabled:cursor-not-allowed hover:bg-surface transition-colors"
-          title={t("refreshAll") || "Refresh All"}
+          title={
+            autoRefreshIntervalMs > 0
+              ? tr("autoRefreshing", "Auto-refreshing")
+              : tr("refreshAll", "Refresh All")
+          }
         >
           <span
             className={`material-symbols-outlined text-[16px] ${refreshingAll ? "animate-spin" : ""}`}
           >
-            refresh
+            {autoRefreshIntervalMs > 0 ? "schedule" : "refresh"}
           </span>
-          <span>{t("refreshAll") || "Refresh All"}</span>
+          <span>
+            <AutoRefreshButtonLabel
+              autoRefreshIntervalMs={autoRefreshIntervalMs}
+              lastRefreshAllAt={lastRefreshAllAt}
+              refreshingAll={refreshingAll}
+              tr={tr}
+            />
+          </span>
         </button>
       </div>
 
@@ -143,13 +239,16 @@ export default function ProviderQuotaWidget() {
         {loading ? (
           <div className="flex items-center justify-center py-8 text-text-muted text-sm">
             <span className="material-symbols-outlined animate-spin mr-2">progress_activity</span>
-            Loading quota information...
+            {tr("loadingQuotas", "Loading...")}
           </div>
         ) : providerEntries.length === 0 ? (
           <div className="text-center py-6 text-sm text-text-muted">
-            No quota-supported providers connected yet.
+            {tr("noProviders", "No Providers Connected")}
             <div className="mt-1 text-xs">
-              Add accounts on the Providers page to see quota status here.
+              {tr(
+                "connectProvidersForQuota",
+                "Connect to providers with OAuth to track your API quota limits and usage."
+              )}
             </div>
           </div>
         ) : (
@@ -165,23 +264,27 @@ export default function ProviderQuotaWidget() {
                   className="rounded-lg border border-border bg-surface/40 p-3 flex flex-col gap-2"
                 >
                   <div className="flex items-center gap-2">
-                    <ProviderIcon provider={provider} size={18} />
+                    <ProviderIcon providerId={provider} size={18} />
                     <span className="font-medium text-sm truncate">
                       {provider.charAt(0).toUpperCase() + provider.slice(1)}
                     </span>
-                    <span className="text-[10px] text-text-muted ml-auto">
-                      {conns.length} account{conns.length > 1 ? "s" : ""}
+                    <span className="text-[10px] text-text-muted ml-auto tabular-nums">
+                      {conns.length}
                     </span>
                   </div>
 
                   {hasQuota ? (
-                    <div className="text-xs text-text-muted">
-                      {Object.keys(cache.quotas).length} quota window(s) tracked
+                    <div className="text-xs text-text-muted" title={tr("details", "Details")}>
+                      {Object.keys(cache.quotas).length}
                     </div>
                   ) : (
-                    <div className="text-xs text-amber-600 dark:text-amber-500">
-                      No quota data yet — click Refresh All
-                    </div>
+                    <button
+                      type="button"
+                      onClick={refreshAll}
+                      className="text-left text-xs text-amber-600 dark:text-amber-500 hover:underline"
+                    >
+                      {tr("refreshAll", "Refresh All")}
+                    </button>
                   )}
 
                   {/* Future: embed small QuotaProgressBar for the primary window here */}
@@ -193,7 +296,8 @@ export default function ProviderQuotaWidget() {
 
         <div className="mt-3 text-[11px] text-right text-text-muted">
           <a href="/dashboard/usage?tab=limits" className="hover:text-primary hover:underline">
-            View full Provider Quota page →
+            {tr("viewDetails", "View details")}
+            <span aria-hidden="true"> &rarr;</span>
           </a>
         </div>
       </div>

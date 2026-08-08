@@ -7,6 +7,7 @@ const { DeepSeekWebExecutor, DEEPSEEK_WEB_BASE } =
 const { DeepSeekWebWithAutoRefreshExecutor } =
   await import("../../open-sse/executors/deepseek-web-with-auto-refresh.ts");
 const { getExecutor, hasSpecializedExecutor } = await import("../../open-sse/executors/index.ts");
+const { serializeToolsToPrompt } = await import("../../open-sse/translator/webTools.ts");
 
 const COMPLETION_URL = `${DEEPSEEK_WEB_BASE}/api/v0/chat/completion`;
 
@@ -56,6 +57,49 @@ test("execute returns 400 with empty apiKey", async () => {
     signal: AbortSignal.timeout(5000),
   });
   assert.equal(result.response.status, 400);
+});
+
+test("tools[] is translated into a <tool> prompt contract, not rejected - issue #2820 (supersedes #2848)", () => {
+  // #2848 made deepseek-web hard-fail tool requests with a 400. #2820 reverses that:
+  // tools[] is now serialized into a <tool> prompt contract and the model's text reply
+  // is parsed back into OpenAI tool_calls. Full execute() round-trip coverage lives in
+  // deepseek-web-tools-execute-2820.test.ts.
+  const prompt = serializeToolsToPrompt([
+    {
+      type: "function",
+      function: {
+        name: "my_tool",
+        description: "test tool",
+        parameters: { type: "object", properties: {} },
+      },
+    },
+  ]);
+  assert.ok(prompt.includes("my_tool"), "tool name serialized into the prompt");
+  assert.ok(prompt.includes("<tool>"), "invocation contract present");
+});
+
+test("execute does NOT 400 on tools[]=[] (empty array, equivalent to no tools)", async () => {
+  const executor = new DeepSeekWebExecutor();
+  const result = await executor.execute({
+    model: "default",
+    body: {
+      messages: [{ role: "user", content: "hi" }],
+      tools: [],
+    },
+    stream: false,
+    credentials: {},
+    signal: AbortSignal.timeout(5000),
+  });
+  assert.equal(
+    result.response.status,
+    400,
+    "still returns 400 but for missing userToken, NOT for tools[]"
+  );
+  const text = await result.response.text();
+  assert.ok(
+    text.includes("userToken"),
+    `expected userToken error (not tools error) for empty tools[], got: ${text}`
+  );
 });
 
 // ─── Test connection ─────────────────────────────────────────────────────
@@ -267,8 +311,19 @@ test("execute: sends PoW response header", async () => {
       "Has Bearer token"
     );
     assert.ok(compCall.headers["X-Ds-Pow-Response"], "Has PoW header");
-    assert.ok(compCall.headers["X-App-Version"], "Has X-App-Version");
-    assert.ok(compCall.headers["X-Client-Platform"] === "web", "Has X-Client-Platform");
+    // Header set matches the current chat.deepseek.com web client (v2.0.0):
+    // legacy X-App-Version dropped, X-Client-Bundle-Id added, version bumped.
+    assert.ok(
+      !("X-App-Version" in compCall.headers),
+      "Legacy X-App-Version must not be sent (removed in web client 2.0.0)"
+    );
+    assert.equal(
+      compCall.headers["X-Client-Bundle-Id"],
+      "com.deepseek.chat",
+      "Sends X-Client-Bundle-Id"
+    );
+    assert.equal(compCall.headers["X-Client-Version"], "2.0.0", "Sends current X-Client-Version");
+    assert.equal(compCall.headers["X-Client-Platform"], "web", "Has X-Client-Platform");
   } finally {
     mock.restore();
   }
@@ -468,6 +523,127 @@ test("DeepSeekWebWithAutoRefresh extends DeepSeekWebExecutor", () => {
 test("isSessionValid starts false", () => {
   const exec = new DeepSeekWebWithAutoRefreshExecutor({ autoRefresh: false });
   assert.equal(exec.isSessionValid(), false);
+});
+
+test("auto-refresh stays idle until a userToken is provided", async () => {
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => {
+    errors.push(args);
+  };
+
+  const exec = new DeepSeekWebWithAutoRefreshExecutor({
+    autoRefresh: true,
+    sessionRefreshInterval: 5,
+  });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(errors.length, 0);
+  } finally {
+    exec.destroy();
+    console.error = originalError;
+  }
+});
+
+test("execute without DeepSeek credentials does not start auto-refresh", async () => {
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => {
+    errors.push(args);
+  };
+
+  const exec = new DeepSeekWebWithAutoRefreshExecutor({
+    autoRefresh: true,
+    sessionRefreshInterval: 5,
+  });
+  try {
+    const result = await exec.execute({
+      model: "default",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: true,
+      credentials: {},
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(result.response.status, 400);
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(errors.length, 0);
+  } finally {
+    exec.destroy();
+    console.error = originalError;
+  }
+});
+
+test("execute without DeepSeek credentials preserves an active auto-refresh session", async () => {
+  const mock = await mockDeepSeekFlow();
+  const exec = new DeepSeekWebWithAutoRefreshExecutor({
+    autoRefresh: true,
+    sessionRefreshInterval: 60_000,
+  });
+  try {
+    const validResult = await exec.execute({
+      model: "default",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: true,
+      credentials: { apiKey: "test-user-token-active-refresh" },
+      signal: AbortSignal.timeout(10000),
+    });
+    assert.ok(validResult.response.ok);
+
+    const activeTimer = exec.refreshTimer;
+    assert.ok(activeTimer);
+    assert.equal(exec.currentUserToken, "test-user-token-active-refresh");
+
+    const invalidResult = await exec.execute({
+      model: "default",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      stream: true,
+      credentials: {},
+      signal: AbortSignal.timeout(5000),
+    });
+    assert.equal(invalidResult.response.status, 400);
+    assert.equal(exec.currentUserToken, "test-user-token-active-refresh");
+    assert.equal(exec.refreshTimer, activeTimer);
+  } finally {
+    exec.destroy();
+    mock.restore();
+  }
+});
+
+test("execute with a new DeepSeek userToken restarts auto-refresh", async () => {
+  const mock = await mockDeepSeekFlow();
+  const exec = new DeepSeekWebWithAutoRefreshExecutor({
+    autoRefresh: true,
+    sessionRefreshInterval: 60_000,
+  });
+  try {
+    const firstResult = await exec.execute({
+      model: "default",
+      body: { messages: [{ role: "user", content: "first" }] },
+      stream: true,
+      credentials: { apiKey: "test-user-token-refresh-1" },
+      signal: AbortSignal.timeout(10000),
+    });
+    assert.ok(firstResult.response.ok);
+
+    const firstTimer = exec.refreshTimer;
+    assert.ok(firstTimer);
+
+    const secondResult = await exec.execute({
+      model: "default",
+      body: { messages: [{ role: "user", content: "second" }] },
+      stream: true,
+      credentials: { apiKey: "test-user-token-refresh-2" },
+      signal: AbortSignal.timeout(10000),
+    });
+    assert.ok(secondResult.response.ok);
+    assert.equal(exec.currentUserToken, "test-user-token-refresh-2");
+    assert.ok(exec.refreshTimer);
+    assert.notEqual(exec.refreshTimer, firstTimer);
+  } finally {
+    exec.destroy();
+    mock.restore();
+  }
 });
 
 // ─── Abort handling ──────────────────────────────────────────────────────

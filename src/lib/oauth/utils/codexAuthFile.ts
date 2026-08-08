@@ -1,6 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
-import { getProviderConnectionById } from "@/lib/localDb";
+import { getCachedProviderConnectionById } from "@/lib/localDb";
 import { createBackup } from "@/shared/services/backupService";
 import { getCliConfigPaths } from "@/shared/services/cliRuntime";
 import {
@@ -197,7 +197,7 @@ function buildCodexAuthPayload(connection: CodexConnectionLike): CodexAuthFilePa
 }
 
 async function resolveFreshCodexConnection(connectionId: string): Promise<CodexConnectionLike> {
-  const connection = (await getProviderConnectionById(connectionId)) as CodexConnectionLike | null;
+  const connection = (await getCachedProviderConnectionById(connectionId)) as CodexConnectionLike | null;
   if (!connection) {
     throw new CodexAuthFileError("Connection not found", 404, "not_found");
   }
@@ -223,15 +223,24 @@ async function resolveFreshCodexConnection(connectionId: string): Promise<CodexC
     );
   }
 
-  const refreshed = await getAccessToken("codex", {
-    connectionId,
-    accessToken: connection.accessToken,
-    refreshToken,
-    expiresAt: connection.expiresAt,
-    expiresIn: connection.expiresIn,
-    idToken: connection.idToken,
-    providerSpecificData: connection.providerSpecificData,
-  });
+  // Pass onPersist so the DB write is atomic with the network call inside the mutex.
+  let persistedRefresh: any = null;
+  const refreshed = await getAccessToken(
+    "codex",
+    {
+      connectionId,
+      accessToken: connection.accessToken,
+      refreshToken,
+      expiresAt: connection.expiresAt,
+      expiresIn: connection.expiresIn,
+      idToken: connection.idToken,
+      providerSpecificData: connection.providerSpecificData,
+    },
+    async (result) => {
+      await updateProviderCredentials(connectionId, result);
+      persistedRefresh = result;
+    }
+  );
 
   if (isUnrecoverableRefreshError(refreshed)) {
     throw new CodexAuthFileError(
@@ -249,7 +258,16 @@ async function resolveFreshCodexConnection(connectionId: string): Promise<CodexC
     );
   }
 
-  await updateProviderCredentials(connectionId, refreshed);
+  // If onPersist was not triggered (no accessToken path), fall back to explicit persist.
+  if (!persistedRefresh) {
+    await updateProviderCredentials(connectionId, refreshed);
+  }
+
+  const effectiveExpiresAt = refreshed.expiresAt
+    ? refreshed.expiresAt
+    : typeof refreshed.expiresIn === "number"
+      ? new Date(Date.now() + refreshed.expiresIn * 1000).toISOString()
+      : connection.expiresAt || null;
 
   return {
     ...connection,
@@ -257,10 +275,7 @@ async function resolveFreshCodexConnection(connectionId: string): Promise<CodexC
     refreshToken: toNonEmptyString(refreshed.refreshToken) || refreshToken,
     expiresIn:
       typeof refreshed.expiresIn === "number" ? refreshed.expiresIn : connection.expiresIn || null,
-    expiresAt:
-      typeof refreshed.expiresIn === "number"
-        ? new Date(Date.now() + refreshed.expiresIn * 1000).toISOString()
-        : connection.expiresAt || null,
+    expiresAt: effectiveExpiresAt,
     providerSpecificData: refreshed.providerSpecificData
       ? {
           ...toRecord(connection.providerSpecificData),

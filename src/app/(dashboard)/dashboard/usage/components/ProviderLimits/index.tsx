@@ -6,77 +6,48 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   parseQuotaData,
   formatQuotaLabel,
+  formatCountdown,
   normalizePlanTier,
   resolvePlanValue,
   calculatePercentage,
+  matchesProviderFilter,
+  buildProviderOptions,
 } from "./utils";
 import Card from "@/shared/components/Card";
 import { CardSkeleton } from "@/shared/components/Loading";
 import { USAGE_SUPPORTED_PROVIDERS } from "@/shared/constants/providers";
 import { pickDisplayValue } from "@/shared/utils/maskEmail";
 import useEmailPrivacyStore from "@/store/emailPrivacyStore";
-import EmailPrivacyToggle from "@/shared/components/EmailPrivacyToggle";
+import { useNotificationStore } from "@/store/notificationStore";
+
+import { useQuotaVisibility } from "./useQuotaVisibility";
 import QuotaCutoffModal from "./QuotaCutoffModal";
 import QuotaCardGrid from "./QuotaCardGrid";
+import CodexResetCreditsModal from "./CodexResetCreditsModal";
+import { useVisibleQuotaData } from "./useVisibleQuotaData";
+import { useCodexResetCreditRedemption } from "./useCodexResetCreditRedemption";
+import { PROVIDER_LABEL, PROVIDER_ORDER, TIER_FILTERS } from "./constants";
+import { formatAutoRefreshCountdown } from "./formatters";
 import { translateUsageOrFallback, type UsageTranslationValues } from "./i18nFallback";
+import { compareTr } from "@/shared/utils/turkishText";
+import { fetchWithTimeout } from "@/shared/utils/fetchTimeout";
+import { isProviderQuotaVisible } from "@/shared/utils/providerQuotaVisibility";
+
+// Bound the two first-paint requests so a stalled connection cannot wedge
+// `initialLoading` on `true` and freeze the quota page on its skeleton forever
+// (same infinite-skeleton class as the providers page). A `try/catch` degrades a
+// *rejection* to a default, but only a timeout/abort can rescue a `fetch()` that
+// never settles (browser connection-pool starvation under the RSC prefetch storm).
+const PROVIDER_LIMITS_FETCH_TIMEOUT_MS = 20_000;
 
 const LS_PURCHASE_FILTER = "omniroute:limits:purchaseFilter";
 const LS_STATUS_FILTER = "omniroute:limits:statusFilter";
 const LS_ENV_FILTER = "omniroute:limits:envFilter";
+const LS_PROVIDER_FILTER = "omniroute:limits:providerFilter";
 
 const MIN_FETCH_INTERVAL_MS = 30000;
 const QUOTA_BAR_GREEN_THRESHOLD = 50;
 const QUOTA_BAR_YELLOW_THRESHOLD = 20;
-
-// Display label per known provider; the icon is resolved by ProviderIcon.
-const PROVIDER_LABEL: Record<string, string> = {
-  antigravity: "Antigravity",
-  "gemini-cli": "Gemini CLI",
-  github: "GitHub Copilot",
-  kiro: "Kiro AI",
-  "amazon-q": "Amazon Q",
-  codex: "OpenAI Codex",
-  claude: "Claude Code",
-  glm: "GLM (Z.AI)",
-  zai: "Z.AI",
-  glmt: "GLM Thinking",
-  "kimi-coding": "Kimi Coding",
-  minimax: "MiniMax",
-  "minimax-cn": "MiniMax CN",
-  nanogpt: "NanoGPT",
-  deepseek: "DeepSeek",
-};
-
-// Group ordering — single source of truth for "where does Codex sit
-// relative to Antigravity on the page".
-const PROVIDER_ORDER: Record<string, number> = {
-  antigravity: 1,
-  "gemini-cli": 2,
-  github: 3,
-  codex: 4,
-  claude: 5,
-  kiro: 6,
-  glm: 7,
-  zai: 8,
-  glmt: 9,
-  "kimi-coding": 10,
-  minimax: 11,
-  "minimax-cn": 12,
-  nanogpt: 13,
-};
-
-const TIER_FILTERS = [
-  { key: "all", labelKey: "tierAll" },
-  { key: "enterprise", labelKey: "tierEnterprise" },
-  { key: "team", labelKey: "tierTeam" },
-  { key: "business", labelKey: "tierBusiness" },
-  { key: "ultra", labelKey: "tierUltra" },
-  { key: "pro", labelKey: "tierPro" },
-  { key: "plus", labelKey: "tierPlus" },
-  { key: "lite", labelKey: "tierLite" },
-  { key: "free", labelKey: "tierFree" },
-  { key: "unknown", labelKey: "tierUnknown" },
-];
 
 type PurchaseTypeKey = "all" | "oauth-free" | "oauth-sub" | "apikey";
 type StatusKey = "all" | "critical" | "alert" | "ok" | "empty";
@@ -119,6 +90,40 @@ function getSoonestResetMs(quotas: any[] | undefined): number {
   }
   return soonest;
 }
+
+function shouldAutoRefreshQuota(provider: string, cached: any): boolean {
+  const quotas = cached?.quotas;
+  if (!Array.isArray(quotas) || quotas.length === 0) return true;
+  if (provider !== "antigravity" && provider !== "agy") return false;
+
+  return quotas.some(
+    (q: any) =>
+      q &&
+      typeof q.modelKey === "string" &&
+      q.modelKey.startsWith("gemini-") &&
+      !q.isCredits &&
+      q.quotaSource !== "retrieveUserQuota"
+  );
+}
+
+const getQuotaBarWidthClass = (pct: number) => {
+  if (pct <= 10) return "w-[10%]";
+  if (pct <= 20) return "w-1/5";
+  if (pct <= 30) return "w-[30%]";
+  if (pct <= 40) return "w-2/5";
+  if (pct <= 50) return "w-1/2";
+  if (pct <= 60) return "w-3/5";
+  if (pct <= 70) return "w-[70%]";
+  if (pct <= 80) return "w-4/5";
+  if (pct <= 90) return "w-[90%]";
+  return "w-full";
+};
+
+const getQuotaToneClasses = (pct: number) => {
+  if (pct <= QUOTA_BAR_YELLOW_THRESHOLD) return "bg-red-500 text-red-500";
+  if (pct <= QUOTA_BAR_GREEN_THRESHOLD) return "bg-yellow-500 text-yellow-500";
+  return "bg-green-500 text-green-500";
+};
 
 const STATUS_TONE: Record<
   StatusKey,
@@ -172,7 +177,15 @@ function aggregateWorst(statuses: StatusKey[]): "critical" | "alert" | "ok" | "e
   return worst;
 }
 
-export default function ProviderLimits() {
+interface ProviderLimitsProps {
+  showFilters?: boolean;
+  autoRefreshInterval?: number;
+}
+
+export default function ProviderLimits({
+  showFilters = true,
+  autoRefreshInterval = 0,
+}: ProviderLimitsProps) {
   const t = useTranslations("usage");
   const tr = useCallback(
     (key: string, fallback: string, values?: UsageTranslationValues) =>
@@ -180,7 +193,9 @@ export default function ProviderLimits() {
     [t]
   );
   const emailsVisible = useEmailPrivacyStore((s) => s.emailsVisible);
+  const notify = useNotificationStore();
   const [connections, setConnections] = useState<any[]>([]);
+  const [togglingActiveId, setTogglingActiveId] = useState<string | null>(null);
   const [quotaData, setQuotaData] = useState<Record<string, any>>({});
   const [loading, setLoading] = useState<Record<string, boolean>>({});
   const [errors, setErrors] = useState<Record<string, string | null>>({});
@@ -188,6 +203,13 @@ export default function ProviderLimits() {
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [initialLoading, setInitialLoading] = useState(true);
   const [tierFilter, setTierFilter] = useState("all");
+  const { quotaVisibility, handleHideQuota, handleShowQuota } = useQuotaVisibility(tr, notify);
+  const resetCreditRedemption = useCodexResetCreditRedemption(
+    tr,
+    setErrors,
+    setQuotaData,
+    setLastRefreshedAt
+  );
 
   const [purchaseTypeFilter, setPurchaseTypeFilter] = useState<PurchaseTypeKey>(() => {
     if (typeof window === "undefined") return "all";
@@ -205,9 +227,16 @@ export default function ProviderLimits() {
     if (typeof window === "undefined") return "all";
     return localStorage.getItem(LS_ENV_FILTER) || "all";
   });
+  const [providerFilter, setProviderFilter] = useState<string>(() => {
+    if (typeof window === "undefined") return "all";
+    return localStorage.getItem(LS_PROVIDER_FILTER) || "all";
+  });
 
   const lastFetchTimeRef = useRef<Record<string, number>>({});
   const staleProbeRef = useRef<Record<string, number>>({});
+  const lastRefreshAllAtRef = useRef<number>(Date.now());
+  const autoRefreshIntervalMs = autoRefreshInterval > 0 ? autoRefreshInterval * 1000 : 0;
+  const [autoRefreshClock, setAutoRefreshClock] = useState(() => Date.now());
   const [cutoffModalConn, setCutoffModalConn] = useState<any | null>(null);
   const [cutoffModalWindows, setCutoffModalWindows] = useState<any[]>([]);
   const [providerWindowDefaults, setProviderWindowDefaults] = useState<
@@ -253,7 +282,9 @@ export default function ProviderLimits() {
 
   const fetchConnections = useCallback(async () => {
     try {
-      const response = await fetch("/api/providers/client");
+      const response = await fetchWithTimeout("/api/providers/client", {
+        timeoutMs: PROVIDER_LIMITS_FETCH_TIMEOUT_MS,
+      });
       if (!response.ok) throw new Error("Failed");
       const data = await response.json();
       const list = data.connections || [];
@@ -264,6 +295,36 @@ export default function ProviderLimits() {
       return [];
     }
   }, []);
+
+  // Toggle a connection's active state straight from the quota overview, so an
+  // operator can park an account that is being routed to despite low quota.
+  // Mirrors saveQuotaWindowThresholds: PUT /api/providers/[id] + optimistic state.
+  const handleToggleActive = useCallback(
+    async (connectionId: string, nextActive: boolean) => {
+      setTogglingActiveId(connectionId);
+      try {
+        const res = await fetch(`/api/providers/${connectionId}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ isActive: nextActive }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        setConnections((prev) =>
+          prev.map((c) => (c.id === connectionId ? { ...c, isActive: nextActive } : c))
+        );
+        notify.success(
+          nextActive
+            ? tr("accountActivated", "Account activated")
+            : tr("accountDeactivated", "Account deactivated")
+        );
+      } catch {
+        notify.error(tr("toggleActiveFailed", "Failed to update account status"));
+      } finally {
+        setTogglingActiveId(null);
+      }
+    },
+    [notify, tr]
+  );
 
   const applyCachedQuotaState = useCallback(
     (connectionList: any[], caches: Record<string, any>) => {
@@ -294,7 +355,9 @@ export default function ProviderLimits() {
 
   const fetchCachedProviderLimits = useCallback(async () => {
     try {
-      const response = await fetch("/api/usage/provider-limits");
+      const response = await fetchWithTimeout("/api/usage/provider-limits", {
+        timeoutMs: PROVIDER_LIMITS_FETCH_TIMEOUT_MS,
+      });
       if (!response.ok) throw new Error("Failed");
       const data = await response.json();
       return data.caches || {};
@@ -322,10 +385,17 @@ export default function ProviderLimits() {
           const errorMsg = errorData.error || response.statusText;
           if (response.status === 404) return;
           if (response.status === 401) {
+            // The on-demand path already attempts a forced, serialized re-mint
+            // before surfacing a 401, so a 401 here means the token is genuinely
+            // dead — make that actionable instead of a silent empty card.
+            const reauthMsg = /re-?authenticat|sign in|log in/i.test(errorMsg)
+              ? errorMsg
+              : `${errorMsg} — re-authenticate this account.`;
             setQuotaData((prev) => ({
               ...prev,
-              [connectionId]: { quotas: [], message: errorMsg },
+              [connectionId]: { quotas: [], message: reauthMsg },
             }));
+            setErrors((prev) => ({ ...prev, [connectionId]: reauthMsg }));
             return;
           }
           throw new Error(`HTTP ${response.status}: ${errorMsg}`);
@@ -381,6 +451,9 @@ export default function ProviderLimits() {
   const refreshAll = useCallback(async () => {
     if (refreshingAllRef.current) return;
     refreshingAllRef.current = true;
+    const now = Date.now();
+    lastRefreshAllAtRef.current = now;
+    setAutoRefreshClock(now);
     setRefreshingAll(true);
     try {
       const response = await fetch("/api/usage/provider-limits", { method: "POST" });
@@ -403,6 +476,33 @@ export default function ProviderLimits() {
   }, [applyCachedQuotaState, fetchConnections]);
 
   useEffect(() => {
+    if (autoRefreshIntervalMs <= 0) return;
+
+    const tick = () => setAutoRefreshClock(Date.now());
+    tick();
+
+    const timer = window.setInterval(tick, 1000);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") tick();
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [autoRefreshIntervalMs]);
+
+  useEffect(() => {
+    if (autoRefreshIntervalMs <= 0) return;
+    if (document.visibilityState !== "visible") return;
+    if (refreshingAllRef.current) return;
+    if (autoRefreshClock - lastRefreshAllAtRef.current >= autoRefreshIntervalMs) {
+      void refreshAll();
+    }
+  }, [autoRefreshClock, autoRefreshIntervalMs, refreshAll]);
+
+  useEffect(() => {
     const init = async () => {
       setInitialLoading(true);
       const [connectionList, caches] = await Promise.all([
@@ -421,6 +521,7 @@ export default function ProviderLimits() {
     () =>
       connections.filter(
         (conn) =>
+          isProviderQuotaVisible(conn) &&
           USAGE_SUPPORTED_PROVIDERS.includes(conn.provider) &&
           (conn.authType === "oauth" || conn.authType === "apikey")
       ),
@@ -432,6 +533,7 @@ export default function ProviderLimits() {
       (a, b) => (PROVIDER_ORDER[a.provider] || 99) - (PROVIDER_ORDER[b.provider] || 99)
     );
   }, [filteredConnections]);
+  const visibleQuotaData = useVisibleQuotaData(sortedConnections, quotaData);
 
   const resolvedPlanByConnection = useMemo(() => {
     const out: Record<string, string | null> = {};
@@ -481,10 +583,10 @@ export default function ProviderLimits() {
   const statusByConnection = useMemo(() => {
     const out: Record<string, StatusKey> = {};
     for (const conn of sortedConnections) {
-      out[conn.id] = getWorstStatus(quotaData[conn.id]?.quotas);
+      out[conn.id] = getWorstStatus(visibleQuotaData[conn.id]?.quotas);
     }
     return out;
-  }, [sortedConnections, quotaData]);
+  }, [sortedConnections, visibleQuotaData]);
 
   const purchaseTypeCounts = useMemo(() => {
     const counts: Record<PurchaseTypeKey, number> = {
@@ -523,7 +625,7 @@ export default function ProviderLimits() {
       const tag = (conn.providerSpecificData?.tag as string | undefined)?.trim();
       if (tag) tags.add(tag);
     }
-    return [...tags].sort((a, b) => a.localeCompare(b));
+    return [...tags].sort((a, b) => compareTr(a, b));
   }, [sortedConnections]);
 
   const envCounts = useMemo(() => {
@@ -538,6 +640,7 @@ export default function ProviderLimits() {
 
   const visibleConnections = useMemo(() => {
     const filtered = sortedConnections.filter((conn) => {
+      if (!matchesProviderFilter(conn, providerFilter)) return false;
       const tierKey = tierByConnection[conn.id]?.key || "unknown";
       if (tierFilter !== "all" && tierKey !== tierFilter) return false;
       if (purchaseTypeFilter !== "all" && purchaseTypeByConnection[conn.id] !== purchaseTypeFilter)
@@ -564,8 +667,8 @@ export default function ProviderLimits() {
       const sa = statusRank[statusByConnection[a.id] || "empty"];
       const sb = statusRank[statusByConnection[b.id] || "empty"];
       if (sa !== sb) return sa - sb;
-      const ra = getSoonestResetMs(quotaData[a.id]?.quotas);
-      const rb = getSoonestResetMs(quotaData[b.id]?.quotas);
+      const ra = getSoonestResetMs(visibleQuotaData[a.id]?.quotas);
+      const rb = getSoonestResetMs(visibleQuotaData[b.id]?.quotas);
       return ra - rb;
     });
   }, [
@@ -577,8 +680,35 @@ export default function ProviderLimits() {
     statusFilter,
     statusByConnection,
     envFilter,
-    quotaData,
+    providerFilter,
+    visibleQuotaData,
   ]);
+
+  // Distinct provider keys present in the current connection set (after the
+  // upstream OAuth/api-key + USAGE_SUPPORTED_PROVIDERS filter), sorted via
+  // the i18n-aware comparator so the dropdown follows the locale's collation.
+  const providerOptions = useMemo(
+    () => buildProviderOptions(sortedConnections, compareTr),
+    [sortedConnections]
+  );
+
+  // Auto-fetch LIVE quota on open for visible connections that have no cached
+  // quota yet (e.g. a Codex account whose access_token expired — its per-connection
+  // live fetch refreshes the token serialized/cascade-safe and surfaces real quota).
+  // Scoped to what's on screen and to the entries actually missing data (the ones
+  // that already have cache render instantly and are not re-fetched), and runs once
+  // per page open so it never loops on the quotaData it writes.
+  const autoLiveFetchedRef = useRef(false);
+  useEffect(() => {
+    if (initialLoading || autoLiveFetchedRef.current || visibleConnections.length === 0) return;
+    autoLiveFetchedRef.current = true;
+    for (const conn of visibleConnections) {
+      const cached = quotaData[conn.id];
+      if (shouldAutoRefreshQuota(conn.provider, cached)) {
+        void fetchQuota(conn.id, conn.provider, { force: true }).catch(() => {});
+      }
+    }
+  }, [initialLoading, visibleConnections, quotaData, fetchQuota]);
 
   const handleSetPurchaseFilter = useCallback((value: PurchaseTypeKey) => {
     setPurchaseTypeFilter(value);
@@ -606,6 +736,49 @@ export default function ProviderLimits() {
       /* ignore */
     }
   }, []);
+
+  const handleSetProviderFilter = useCallback((value: string) => {
+    setProviderFilter(value);
+    try {
+      localStorage.setItem(LS_PROVIDER_FILTER, value);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const renderInlineQuotaSummary = (quotas: any[]) => {
+    if (!quotas || quotas.length === 0) return null;
+    return (
+      <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px] text-text-muted">
+        {quotas.slice(0, 3).map((q, index) => {
+          const pct = q.unlimited
+            ? 100
+            : Math.round(q.remainingPercentage ?? calculatePercentage(q.used, q.total));
+          const cd = formatCountdown(q.resetAt);
+          const tone = getQuotaToneClasses(pct);
+          return (
+            <span
+              key={`${q.name || "quota"}-${q.modelKey || ""}-${index}`}
+              className="inline-flex items-center gap-1"
+              title={q.displayName || formatQuotaLabel(q.name)}
+            >
+              <span className={`tabular-nums ${tone.split(" ")[1]}`}>
+                {q.unlimited ? "∞" : `${pct}%`}
+              </span>
+              {!q.unlimited && (
+                <span className="h-1 w-14 rounded-sm bg-border/60 overflow-hidden">
+                  <span
+                    className={`block h-full ${tone.split(" ")[0]} ${getQuotaBarWidthClass(pct)}`}
+                  />
+                </span>
+              )}
+              {cd ? <span>{`⏱ ${cd}`}</span> : null}
+            </span>
+          );
+        })}
+      </div>
+    );
+  };
 
   if (initialLoading) {
     return (
@@ -641,155 +814,198 @@ export default function ProviderLimits() {
             {visibleConnections.length !== sortedConnections.length &&
               ` ${t("filteredFromCount", { count: sortedConnections.length })}`}
           </span>
-          <EmailPrivacyToggle />
         </div>
 
         <button
           onClick={refreshAll}
           disabled={refreshingAll}
           className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-bg-subtle border border-border text-text-main text-[13px] disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+          title={
+            autoRefreshIntervalMs > 0 ? tr("autoRefreshing", "Auto-refreshing") : t("refreshAll")
+          }
         >
           <span
             className={`material-symbols-outlined text-[16px] ${refreshingAll ? "animate-spin" : ""}`}
           >
-            refresh
+            {autoRefreshIntervalMs > 0 ? "schedule" : "refresh"}
           </span>
-          {t("refreshAll")}
+          {refreshingAll
+            ? tr("refreshing", "Refreshing")
+            : autoRefreshIntervalMs > 0
+              ? `${tr("autoRefreshing", "Auto-refreshing")} ${formatAutoRefreshCountdown(
+                  Math.max(
+                    0,
+                    autoRefreshIntervalMs - (autoRefreshClock - lastRefreshAllAtRef.current)
+                  )
+                )}`
+              : t("refreshAll")}
         </button>
       </div>
 
-      {/* Summary stats — clickable status filter */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-        {(["all", "critical", "alert", "ok"] as StatusKey[]).map((key) => {
-          const tone = STATUS_TONE[key];
-          const labelMap: Record<string, string> = {
-            all: tr("statTotal", "Total"),
-            critical: tr("statCritical", "Critical"),
-            alert: tr("statAlert", "Alert"),
-            ok: tr("statHealthy", "Healthy"),
-          };
-          const active = statusFilter === key;
-          const count = statusCounts[key] || 0;
-          return (
-            <button
-              key={key}
-              type="button"
-              onClick={() => handleSetStatusFilter(key)}
-              className="text-left rounded-lg px-3 py-2.5 border transition-colors cursor-pointer"
-              style={{
-                background: active ? tone.bg : "var(--color-surface)",
-                borderColor: active ? tone.ring : "var(--color-border)",
-              }}
-            >
-              <div className="flex items-center justify-between">
-                <span className="text-[11px] uppercase tracking-wider font-semibold text-text-muted">
-                  {labelMap[key]}
-                </span>
-                {key !== "all" && (
-                  <span
-                    className="w-1.5 h-1.5 rounded-full"
-                    style={{ background: tone.dot }}
-                    aria-hidden
-                  />
-                )}
-              </div>
-              <div
-                className="mt-0.5 text-2xl font-bold tabular-nums"
-                style={{ color: key === "all" ? "var(--color-text-main)" : tone.text }}
+      {showFilters && (
+        <>
+          {/* Summary stats — clickable status filter */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            {(["all", "critical", "alert", "ok"] as StatusKey[]).map((key) => {
+              const tone = STATUS_TONE[key];
+              const labelMap: Record<string, string> = {
+                all: tr("statTotal", "Total"),
+                critical: tr("statCritical", "Critical"),
+                alert: tr("statAlert", "Alert"),
+                ok: tr("statHealthy", "Healthy"),
+              };
+              const active = statusFilter === key;
+              const count = statusCounts[key] || 0;
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => handleSetStatusFilter(key)}
+                  className="text-left rounded-lg px-3 py-2.5 border transition-colors cursor-pointer"
+                  style={{
+                    background: active ? tone.bg : "var(--color-surface)",
+                    borderColor: active ? tone.ring : "var(--color-border)",
+                  }}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] uppercase tracking-wider font-semibold text-text-muted">
+                      {labelMap[key]}
+                    </span>
+                    {key !== "all" && (
+                      <span
+                        className="w-1.5 h-1.5 rounded-full"
+                        style={{ background: tone.dot }}
+                        aria-hidden
+                      />
+                    )}
+                  </div>
+                  <div
+                    className="mt-0.5 text-2xl font-bold tabular-nums"
+                    style={{ color: key === "all" ? "var(--color-text-main)" : tone.text }}
+                  >
+                    {count}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Purchase Type filter */}
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-[11px] uppercase tracking-wider text-text-muted font-semibold mr-1">
+              {tr("filterPurchaseTypeLabel", "Type")}
+            </span>
+            {PURCHASE_TYPES.map((type) => {
+              const count = purchaseTypeCounts[type.key] || 0;
+              if (type.key !== "all" && count === 0) return null;
+              const active = purchaseTypeFilter === type.key;
+              return (
+                <button
+                  key={type.key}
+                  onClick={() => handleSetPurchaseFilter(type.key)}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold cursor-pointer"
+                  style={{
+                    border: active
+                      ? "1px solid var(--color-primary, #E54D5E)"
+                      : "1px solid var(--color-border)",
+                    background: active ? "rgba(229,77,94,0.1)" : "transparent",
+                    color: active ? "var(--color-primary, #E54D5E)" : "var(--color-text-muted)",
+                  }}
+                >
+                  <span>{tr(type.labelKey, type.fallback)}</span>
+                  <span className="opacity-85">{count}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Tier filter */}
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-[11px] uppercase tracking-wider text-text-muted font-semibold mr-1">
+              {tr("filterTierLabel", "Tier")}
+            </span>
+            {TIER_FILTERS.map((tier) => {
+              if (tier.key !== "all" && !tierCounts[tier.key]) return null;
+              const active = tierFilter === tier.key;
+              return (
+                <button
+                  key={tier.key}
+                  onClick={() => setTierFilter(tier.key)}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold cursor-pointer"
+                  style={{
+                    border: active
+                      ? "1px solid var(--color-primary, #E54D5E)"
+                      : "1px solid var(--color-border)",
+                    background: active ? "rgba(229,77,94,0.1)" : "transparent",
+                    color: active ? "var(--color-primary, #E54D5E)" : "var(--color-text-muted)",
+                  }}
+                >
+                  <span>{tier.label || t(tier.labelKey!)}</span>
+                  <span className="opacity-85">{tierCounts[tier.key] || 0}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Provider filter — single-select dropdown of providers actually
+              present in the current account set. Auto-falls back to "all" if
+              the persisted choice no longer exists in this session. */}
+          {providerOptions.length > 1 && (
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-[11px] uppercase tracking-wider text-text-muted font-semibold mr-1">
+                {tr("filterProviderLabel", "Provider")}
+              </span>
+              <select
+                value={
+                  providerFilter === "all" || providerOptions.includes(providerFilter)
+                    ? providerFilter
+                    : "all"
+                }
+                onChange={(event) => handleSetProviderFilter(event.target.value)}
+                aria-label={tr("filterProviderAriaLabel", "Filter quota providers")}
+                className="h-8 rounded-full border border-border bg-transparent px-3 text-xs font-semibold text-text-muted cursor-pointer"
               >
-                {count}
-              </div>
-            </button>
-          );
-        })}
-      </div>
+                <option value="all">{tr("filterProviderAll", "All providers")}</option>
+                {providerOptions.map((provider) => (
+                  <option key={provider} value={provider}>
+                    {PROVIDER_LABEL[provider] || provider}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
 
-      {/* Purchase Type filter */}
-      <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-[11px] uppercase tracking-wider text-text-muted font-semibold mr-1">
-          {tr("filterPurchaseTypeLabel", "Type")}
-        </span>
-        {PURCHASE_TYPES.map((type) => {
-          const count = purchaseTypeCounts[type.key] || 0;
-          if (type.key !== "all" && count === 0) return null;
-          const active = purchaseTypeFilter === type.key;
-          return (
-            <button
-              key={type.key}
-              onClick={() => handleSetPurchaseFilter(type.key)}
-              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold cursor-pointer"
-              style={{
-                border: active
-                  ? "1px solid var(--color-primary, #E54D5E)"
-                  : "1px solid var(--color-border)",
-                background: active ? "rgba(229,77,94,0.1)" : "transparent",
-                color: active ? "var(--color-primary, #E54D5E)" : "var(--color-text-muted)",
-              }}
-            >
-              <span>{tr(type.labelKey, type.fallback)}</span>
-              <span className="opacity-85">{count}</span>
-            </button>
-          );
-        })}
-      </div>
-
-      {/* Tier filter */}
-      <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-[11px] uppercase tracking-wider text-text-muted font-semibold mr-1">
-          {tr("filterTierLabel", "Tier")}
-        </span>
-        {TIER_FILTERS.map((tier) => {
-          if (tier.key !== "all" && !tierCounts[tier.key]) return null;
-          const active = tierFilter === tier.key;
-          return (
-            <button
-              key={tier.key}
-              onClick={() => setTierFilter(tier.key)}
-              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold cursor-pointer"
-              style={{
-                border: active
-                  ? "1px solid var(--color-primary, #E54D5E)"
-                  : "1px solid var(--color-border)",
-                background: active ? "rgba(229,77,94,0.1)" : "transparent",
-                color: active ? "var(--color-primary, #E54D5E)" : "var(--color-text-muted)",
-              }}
-            >
-              <span>{tier.label || t(tier.labelKey!)}</span>
-              <span className="opacity-85">{tierCounts[tier.key] || 0}</span>
-            </button>
-          );
-        })}
-      </div>
-
-      {/* Env filter — only renders when at least one connection has a tag */}
-      {envTags.length > 0 && (
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-[11px] uppercase tracking-wider text-text-muted font-semibold mr-1">
-            {tr("filterEnvLabel", "Env")}
-          </span>
-          {(["all", ...envTags] as string[]).map((tag) => {
-            const count = envCounts[tag] || 0;
-            const active = envFilter === tag;
-            const label = tag === "all" ? tr("filterEnvAll", "All") : tag;
-            return (
-              <button
-                key={tag}
-                onClick={() => handleSetEnvFilter(tag)}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold cursor-pointer"
-                style={{
-                  border: active
-                    ? "1px solid var(--color-primary, #E54D5E)"
-                    : "1px solid var(--color-border)",
-                  background: active ? "rgba(229,77,94,0.1)" : "transparent",
-                  color: active ? "var(--color-primary, #E54D5E)" : "var(--color-text-muted)",
-                }}
-              >
-                <span>{label}</span>
-                <span className="opacity-85">{count}</span>
-              </button>
-            );
-          })}
-        </div>
+          {/* Env filter — only renders when at least one connection has a tag */}
+          {envTags.length > 0 && (
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-[11px] uppercase tracking-wider text-text-muted font-semibold mr-1">
+                {tr("filterEnvLabel", "Env")}
+              </span>
+              {(["all", ...envTags] as string[]).map((tag) => {
+                const count = envCounts[tag] || 0;
+                const active = envFilter === tag;
+                const label = tag === "all" ? tr("filterEnvAll", "All") : tag;
+                return (
+                  <button
+                    key={tag}
+                    onClick={() => handleSetEnvFilter(tag)}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold cursor-pointer"
+                    style={{
+                      border: active
+                        ? "1px solid var(--color-primary, #E54D5E)"
+                        : "1px solid var(--color-border)",
+                      background: active ? "rgba(229,77,94,0.1)" : "transparent",
+                      color: active ? "var(--color-primary, #E54D5E)" : "var(--color-text-muted)",
+                    }}
+                  >
+                    <span>{label}</span>
+                    <span className="opacity-85">{count}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </>
       )}
 
       {/* Provider groups */}
@@ -809,22 +1025,42 @@ export default function ProviderLimits() {
 
         <QuotaCardGrid
           connections={visibleConnections}
-          quotaData={quotaData}
+          quotaData={visibleQuotaData}
           loading={loading}
           errors={errors}
           lastRefreshedAt={lastRefreshedAt}
           emailsVisible={emailsVisible}
           providerLabels={PROVIDER_LABEL}
+          renderInlineQuotaSummary={(quota) => renderInlineQuotaSummary(quota.quotas)}
           onRefresh={refreshProvider}
           onOpenCutoff={(conn) => {
-            const windows = (quotaData[conn.id]?.quotas || []).filter(
+            const windows = (visibleQuotaData[conn.id]?.quotas || []).filter(
               (q: any) => q && typeof q.name === "string" && !q.isCredits
             );
             setCutoffModalWindows(windows);
             setCutoffModalConn(conn);
           }}
+          onOpenResetCredits={resetCreditRedemption.openCodexResetCredits}
+          onToggleActive={handleToggleActive}
+          togglingActiveId={togglingActiveId}
+          quotaVisibility={quotaVisibility}
+          onHideQuota={handleHideQuota}
+          onShowQuota={handleShowQuota}
+          redeemingResetCreditId={resetCreditRedemption.redeemingResetCreditId}
+          loadingResetCreditsId={resetCreditRedemption.loadingResetCreditsId}
         />
       </div>
+
+      {resetCreditRedemption.resetCreditPicker && (
+        <CodexResetCreditsModal
+          isOpen={true}
+          credits={resetCreditRedemption.resetCreditPicker.credits}
+          availableCount={resetCreditRedemption.resetCreditPicker.availableCount}
+          loading={resetCreditRedemption.redeemingResetCreditId !== null}
+          onClose={resetCreditRedemption.closeResetCreditPicker}
+          onRedeem={resetCreditRedemption.redeemCodexResetCredit}
+        />
+      )}
 
       {cutoffModalConn && (
         <QuotaCutoffModal
@@ -833,6 +1069,7 @@ export default function ProviderLimits() {
             setCutoffModalConn(null);
             setCutoffModalWindows([]);
           }}
+          connectionId={cutoffModalConn.id}
           connectionName={
             pickDisplayValue(
               [cutoffModalConn.name, cutoffModalConn.displayName, cutoffModalConn.email],

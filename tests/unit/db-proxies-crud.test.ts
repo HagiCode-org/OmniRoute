@@ -41,7 +41,7 @@ test.after(async () => {
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
 });
 
-test("proxy CRUD redacts secrets by default and preserves stored credentials on blank update", async () => {
+test("proxy CRUD redacts secrets by default and preserves stored credentials when omitted", async () => {
   const created = await proxiesDb.createProxy({
     name: "Primary Proxy",
     type: "http",
@@ -60,12 +60,10 @@ test("proxy CRUD redacts secrets by default and preserves stored credentials on 
   const withSecrets = await proxiesDb.getProxyById(created.id, { includeSecrets: true });
   const updated = await proxiesDb.updateProxy(created.id, {
     host: "proxy-updated.local",
-    username: "",
-    password: "",
     notes: "updated",
   });
   const updatedWithSecrets = await proxiesDb.getProxyById(created.id, { includeSecrets: true });
-  const listed = await proxiesDb.listProxies();
+  const { items: listed } = await proxiesDb.listProxies();
 
   assert.equal(withSecrets.username, "user-a");
   assert.equal(withSecrets.password, "pass-a");
@@ -78,6 +76,31 @@ test("proxy CRUD redacts secrets by default and preserves stored credentials on 
   assert.equal(listed[0].username, "***");
   assert.equal(listed[0].password, "***");
   assert.equal(listed[0].source, "dashboard-custom");
+});
+
+test("proxy CRUD clears stored credentials when blanks are explicitly provided", async () => {
+  const created = await proxiesDb.createProxy({
+    name: "Clearable Proxy",
+    type: "http",
+    host: "clearable.local",
+    port: 8080,
+    username: "user-a",
+    password: "pass-a",
+  });
+
+  const updated = await proxiesDb.updateProxy(created.id, {
+    username: "",
+    password: "",
+  });
+  const updatedWithSecrets = await proxiesDb.getProxyById(created.id, { includeSecrets: true });
+  const { items: listed } = await proxiesDb.listProxies();
+
+  assert.equal(updated.username, "");
+  assert.equal(updated.password, "");
+  assert.equal(updatedWithSecrets.username, "");
+  assert.equal(updatedWithSecrets.password, "");
+  assert.equal(listed[0].username, "");
+  assert.equal(listed[0].password, "");
 });
 
 test("proxy assignments resolve by account, provider and global scope", async () => {
@@ -286,7 +309,7 @@ test("legacy proxy config migrates into the registry and subsequent runs can be 
 
   const migrated = await proxiesDb.migrateLegacyProxyConfigToRegistry();
   const assignments = await proxiesDb.getProxyAssignments();
-  const proxies = await proxiesDb.listProxies({ includeSecrets: true });
+  const { items: proxies } = await proxiesDb.listProxies({ includeSecrets: true });
   const skipped = await proxiesDb.migrateLegacyProxyConfigToRegistry();
 
   assert.equal(migrated.skipped, false);

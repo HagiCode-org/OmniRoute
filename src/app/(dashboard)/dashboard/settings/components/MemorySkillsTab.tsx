@@ -36,7 +36,9 @@ const STRATEGIES = [
 
 export default function MemorySkillsTab() {
   const [config, setConfig] = useState<MemoryConfig>({
-    enabled: true,
+    // Off by default (matches DEFAULT_MEMORY_SETTINGS) — memory injects ~maxTokens
+    // of billed context per request, so it's opt-in. See PRD-2026-06-19-no-memory-header.
+    enabled: false,
     maxTokens: 2000,
     retentionDays: 30,
     strategy: "hybrid",
@@ -203,18 +205,23 @@ export default function MemorySkillsTab() {
       const data = await res.json().catch(() => null);
       if (res.ok && data?.ok) {
         setQdrantCleanupMsg(
-          `OK: removeu ${data.deletedCount ?? 0} ponto(s) (retencao: ${data.retentionDays} dias)`
+          t("qdrantCleanupSuccess", {
+            count: data.deletedCount ?? 0,
+            days: data.retentionDays,
+          })
         );
       } else {
-        const err = data?.error || "Falha na limpeza";
-        setQdrantCleanupMsg(`Erro: ${String(err)}`);
+        const err = data?.error || t("qdrantCleanupFailed");
+        setQdrantCleanupMsg(t("qdrantCleanupError", { error: String(err) }));
       }
     } catch (e) {
-      setQdrantCleanupMsg(`Erro: ${e instanceof Error ? e.message : String(e)}`);
+      setQdrantCleanupMsg(
+        t("qdrantCleanupError", { error: e instanceof Error ? e.message : String(e) })
+      );
     } finally {
       setQdrantCleanupLoading(false);
     }
-  }, []);
+  }, [t]);
 
   const saveSkillsmpApiKey = useCallback(async () => {
     setSkillsmpSaving(true);
@@ -354,6 +361,22 @@ export default function MemorySkillsTab() {
             />
           </button>
         </div>
+
+        {/* Token-cost warning — memory injection is billed (PRD-2026-06-19) */}
+        {config.enabled && (
+          <div
+            className="flex items-start gap-2 p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 mb-4 text-amber-600 dark:text-amber-400"
+            role="note"
+            data-testid="memory-token-cost-warning"
+          >
+            <span className="material-symbols-outlined text-[18px] leading-none mt-0.5" aria-hidden="true">
+              info
+            </span>
+            <p className="text-xs leading-relaxed">
+              {t("memoryTokenCostWarning", { tokens: config.maxTokens.toLocaleString() })}
+            </p>
+          </div>
+        )}
 
         {/* Memory config fields */}
         {config.enabled && (

@@ -1,44 +1,93 @@
-import Redis from "ioredis";
+import type Redis from "ioredis";
 
-// Issue #2357: When OmniRoute runs in Docker without a sibling Redis
-// container (the default `docker run` / portainer one-click install), every
-// rate-limit lookup hits `redis://localhost:6379` inside the container and
-// spams `[REDIS] Error: connect ECONNREFUSED 127.0.0.1:6379`. Rate limiting
-// is non-essential for a single-instance deployment, so we now:
-//
-// 1) Treat `REDIS_URL` as opt-in. If it's not set we silently fall back to
-//    the in-memory store (same code path used by unit tests).
-// 2) Even when set, errors degrade gracefully: a single startup warning,
-//    then suppress per-request error spam after the first occurrence.
-const REDIS_URL = process.env.REDIS_URL;
-const REDIS_ENABLED = Boolean(REDIS_URL);
-
-let redisClient: Redis | null = null;
-let redisErrorLogged = false;
-
-export function getRedisClient(): Redis | null {
-  if (!REDIS_ENABLED) return null;
-  if (!redisClient) {
-    redisClient = new Redis(REDIS_URL as string, {
-      maxRetriesPerRequest: 3,
-      enableReadyCheck: false,
-      lazyConnect: false,
-      retryStrategy(times) {
-        return Math.min(times * 50, 2000); // Exponential backoff
-      },
-    });
-    redisClient.on("error", (err) => {
-      if (!redisErrorLogged) {
-        console.warn("[REDIS] Connection error — rate limiter degraded to in-memory:", err.message);
-        redisErrorLogged = true;
-      }
-    });
-  }
-  return redisClient;
+// Redis is optional. When REDIS_URL is unset, use a process-local fallback
+// instead of probing localhost on every API request.
+const REDIS_URL = process.env.REDIS_URL?.trim() || "";
+if (process.env.NODE_ENV === "production" && !REDIS_URL) {
+  console.warn("[REDIS] REDIS_URL is not set in production. Using in-memory rate limiting.");
 }
 
-export function isRedisEnabled(): boolean {
-  return REDIS_ENABLED;
+// #6559 — `ioredis` must stay a LAZY dependency here. This module is bundled
+// (via esbuild --packages=external) into the MCP server output, and esbuild
+// hoists any static top-level `import ... from "ioredis"` into a real
+// top-level ESM import in the compiled bundle — even though this module is
+// only ever reached through a dynamic `await import(...)` several call-sites
+// deep (apiKeys.ts -> mcpCallerIdentity.ts -> compressionTools.ts -> server.ts).
+// A static import forces Node to resolve `ioredis` at module-link time,
+// before any `--mcp` startup code runs, and `ioredis` is not guaranteed to
+// ship in the MCP-only bundle's node_modules. Mirrors the established
+// soft-dependency pattern in src/lib/quota/redisQuotaStore.ts.
+let redisClientPromise: Promise<Redis> | null = null;
+
+export function isRedisConfigured(): boolean {
+  return REDIS_URL.length > 0;
+}
+
+/**
+ * State-change-gated log throttle for the Redis error handler.
+ *
+ * #4878: when REDIS_URL points at a non-running server, ioredis retries on a
+ * backoff and fires the "error" event on every attempt, flooding the logs with
+ * identical "[REDIS] Error:" lines. We only want to log when the error STATE
+ * actually changes (first occurrence, or a different error message), not on
+ * every retry of the same failure.
+ */
+export function createRedisLogThrottle() {
+  let lastLogged: string | null = null;
+  return {
+    shouldLog(message: string): boolean {
+      if (message === lastLogged) return false;
+      lastLogged = message;
+      return true;
+    },
+    reset(): void {
+      lastLogged = null;
+    },
+  };
+}
+
+const redisLogThrottle = createRedisLogThrottle();
+
+// Exposed for unit tests — returns a fresh, isolated throttle instance.
+export function _createRedisLogThrottleForTests() {
+  return createRedisLogThrottle();
+}
+
+/**
+ * Return the singleton Redis client, creating it (lazily importing `ioredis`)
+ * on first call. Throws SYNCHRONOUSLY (not a rejected Promise) when Redis is
+ * not configured — callers rely on this to fail fast without an `await`.
+ * Otherwise returns a Promise that resolves once the client is constructed.
+ */
+export function getRedisClient(): Promise<Redis> {
+  if (!isRedisConfigured()) {
+    throw new Error("Redis is not configured");
+  }
+
+  if (!redisClientPromise) {
+    redisClientPromise = (async () => {
+      // Lazy dynamic import — see the #6559 note above the singleton declaration.
+      const mod = await import("ioredis");
+      const RedisCtor = (mod.default ?? mod) as typeof Redis;
+      const client = new RedisCtor(REDIS_URL, {
+        maxRetriesPerRequest: 3,
+        enableReadyCheck: false,
+        retryStrategy(times) {
+          return Math.min(times * 50, 2000); // Exponential backoff
+        },
+      });
+      client.on("error", (err) => {
+        // Throttle: log once per error-state change instead of on every retry (#4878).
+        if (redisLogThrottle.shouldLog(err.message)) {
+          console.error("[REDIS] Error:", err.message);
+        }
+      });
+      // A successful connection resets the throttle so the next failure logs again.
+      client.on("ready", () => redisLogThrottle.reset());
+      return client;
+    })();
+  }
+  return redisClientPromise;
 }
 
 export interface RateLimitRule {
@@ -71,7 +120,7 @@ end
 for i, rule in ipairs(rules) do
   local current_window = math.floor(current_time / rule.window)
   local window_key = key_prefix .. ":" .. rule.window .. ":" .. current_window
-  
+
   local count = tonumber(redis.call("GET", window_key) or "0")
   if count >= rule.limit then
     return { 0, rule.window } -- Reject, return which window failed
@@ -82,7 +131,7 @@ end
 for i, rule in ipairs(rules) do
   local current_window = math.floor(current_time / rule.window)
   local window_key = key_prefix .. ":" .. rule.window .. ":" .. current_window
-  
+
   local count = redis.call("INCR", window_key)
   if count == 1 then
     -- TTL is twice the window size to ensure it covers the current window safely
@@ -94,31 +143,78 @@ return { 1, 0 } -- Accepted
 `;
 
 const TEST_MEMORY_STORE = new Map<string, number>();
+const FALLBACK_MEMORY_STORE = new Map<string, number>();
 let explicitTestMode = false;
+
+// Minimum store size before we bother sweeping (avoids O(n) cost on tiny stores)
+const EVICTION_THRESHOLD = 50;
+
+/**
+ * Evict all in-memory rate-limit window keys whose window has already ended.
+ *
+ * Key format: `rl:api_key:{id}:{windowSize}:{windowNumber}`
+ * A key expires at epoch-second `(windowNumber + 1) * windowSize`.
+ *
+ * Exported so tests can exercise it directly and so callers can invoke it
+ * with any store (TEST_MEMORY_STORE or FALLBACK_MEMORY_STORE).
+ *
+ * Fixes: #4041 — FALLBACK_MEMORY_STORE accumulated indefinitely → OOM (#4771).
+ */
+export function evictStaleRateLimitWindows(store: Map<string, number>, nowSeconds: number): void {
+  for (const key of store.keys()) {
+    // Format: rl:api_key:{id}:{windowSize}:{windowNumber}
+    // Split only on the last two colons to handle ids that contain colons.
+    const lastColon = key.lastIndexOf(":");
+    if (lastColon === -1) continue;
+    const secondLastColon = key.lastIndexOf(":", lastColon - 1);
+    if (secondLastColon === -1) continue;
+
+    const windowNumber = Number(key.slice(lastColon + 1));
+    const windowSize = Number(key.slice(secondLastColon + 1, lastColon));
+
+    if (!Number.isFinite(windowNumber) || !Number.isFinite(windowSize) || windowSize <= 0) {
+      continue;
+    }
+
+    const windowEnd = (windowNumber + 1) * windowSize;
+    if (windowEnd <= nowSeconds) {
+      store.delete(key);
+    }
+  }
+}
 
 export function setRateLimiterTestMode(enabled: boolean) {
   explicitTestMode = enabled;
   if (enabled) TEST_MEMORY_STORE.clear();
 }
 
-/**
- * Checks multi-window rate limits for an API key atomically via Redis.
- */
-function checkRateLimitInMemory(keyId: string, rules: RateLimitRule[]): RateLimitResult {
+function checkInMemoryRateLimit(
+  store: Map<string, number>,
+  keyId: string,
+  rules: RateLimitRule[]
+): RateLimitResult {
   const now = Math.floor(Date.now() / 1000);
+
+  // Opportunistic eviction: sweep stale windows when the store has grown past
+  // the threshold. Bounded O(n) sweep — no timer, no background work.
+  if (store.size > EVICTION_THRESHOLD) {
+    evictStaleRateLimitWindows(store, now);
+  }
   for (const rule of rules) {
     const currentWindow = Math.floor(now / rule.window);
     const windowKey = `rl:api_key:${keyId}:${rule.window}:${currentWindow}`;
-    const count = TEST_MEMORY_STORE.get(windowKey) || 0;
+    const count = store.get(windowKey) || 0;
     if (count >= rule.limit) {
       return { allowed: false, failedWindow: rule.window };
     }
   }
+
   for (const rule of rules) {
     const currentWindow = Math.floor(now / rule.window);
     const windowKey = `rl:api_key:${keyId}:${rule.window}:${currentWindow}`;
-    TEST_MEMORY_STORE.set(windowKey, (TEST_MEMORY_STORE.get(windowKey) || 0) + 1);
+    store.set(windowKey, (store.get(windowKey) || 0) + 1);
   }
+
   return { allowed: true };
 }
 
@@ -128,23 +224,21 @@ export async function checkRateLimit(
 ): Promise<RateLimitResult> {
   if (!rules || rules.length === 0) return { allowed: true };
 
-  // ── In-memory path for unit tests AND single-instance deployments ──
-  // Issue #2357: when REDIS_URL is unset we used to hammer
-  // localhost:6379 and surface a stream of ECONNREFUSED errors. Now the
-  // in-memory fallback handles single-instance setups silently. The
-  // explicit test-mode flag still wins so suites can opt-in even with
-  // REDIS_URL set.
+  // ── In-memory mock for unit tests ──
   const isTestMode =
     explicitTestMode ||
     process.env.NODE_ENV === "test" ||
     process.env.DISABLE_SQLITE_AUTO_BACKUP === "true";
 
-  if (isTestMode || !isRedisEnabled()) {
-    return checkRateLimitInMemory(keyId, rules);
+  if (isTestMode) {
+    return checkInMemoryRateLimit(TEST_MEMORY_STORE, keyId, rules);
   }
 
-  const redis = getRedisClient();
-  if (!redis) return checkRateLimitInMemory(keyId, rules);
+  if (!isRedisConfigured()) {
+    return checkInMemoryRateLimit(FALLBACK_MEMORY_STORE, keyId, rules);
+  }
+
+  const redis = await getRedisClient();
 
   const args: (string | number)[] = [Math.floor(Date.now() / 1000)];
 
@@ -164,16 +258,8 @@ export async function checkRateLimit(
 
     return { allowed: true };
   } catch (error) {
-    // Fail-open strategy if Redis goes down to prevent complete API outage.
-    // First failure already logged in the connection error handler — keep
-    // per-request output to a debug line to avoid log spam.
-    if (!redisErrorLogged) {
-      console.warn(
-        "[RATE_LIMITER] Redis eval failed, bypassing rate limit:",
-        (error as Error)?.message ?? String(error)
-      );
-      redisErrorLogged = true;
-    }
+    // Fail-open strategy if Redis goes down to prevent complete API outage
+    console.error("[RATE_LIMITER] Redis eval failed, bypassing rate limit:", error);
     return { allowed: true };
   }
 }

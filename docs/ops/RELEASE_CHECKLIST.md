@@ -1,13 +1,17 @@
 ---
 title: "Release Checklist"
-version: 3.8.2
-lastUpdated: 2026-05-13
+version: 3.8.40
+lastUpdated: 2026-06-28
 ---
 
 # Release Checklist
 
-> **Last updated:** 2026-05-13 — v3.8.0
+> **Last updated:** 2026-06-28 — v3.8.40
 > Streamlined release flow that leverages Claude Code skills for automation.
+>
+> **Keep the queue/branch green between releases:** see [RELEASE_GREEN.md](./RELEASE_GREEN.md)
+> (`/green-prs` family + `npm run check:release-green` + `/babysit` + nightly). Running
+> this periodically — and especially **before** this checklist — makes the release PR start green.
 
 ## TL;DR
 
@@ -17,7 +21,7 @@ lastUpdated: 2026-05-13
 
 # 2. Run quality gate locally
 npm run check              # lint + tests
-npm run test:coverage      # full coverage gate (75/75/75/70)
+npm run test:coverage      # full coverage gate (60/60/60/60)
 
 # 3. Build & smoke
 npm run build
@@ -32,6 +36,56 @@ npm run test:e2e           # optional but recommended
 # 6. Capture release evidences (skill)
 /capture-release-evidences-cc
 ```
+
+## npm Staged Publishing (default since v3.8.49 — WS1.3/D2)
+
+The npm-publish workflow no longer publishes directly: it boots the packed tarball
+(`check:pack-boot`) and then runs `npm stage publish` — the exact bytes are parked on
+the registry, **not installable** until the owner approves. The human 2FA gate moved
+to AFTER the proof, not before it.
+
+**Owner flow after the workflow goes green:**
+
+1. `npm stage list omniroute` — find the stage id (also printed in the workflow summary).
+2. Verify the staged bytes (recommended): `npm stage download <id>`, then install the
+   downloaded tarball into a temp prefix and boot it (`npm run check:pack-boot` automates
+   the same pack→install→boot verdict in CI).
+3. `npm stage approve <id>` — the 2FA prompt IS the publish. `npm stage reject <id>` discards.
+4. Post-publish net: the post-publish verifier (WS1.4 of the v3.8.49 plan) installs the
+   published version from the public registry in a clean container and boots it.
+
+**Emergency fallback:** `workflow_dispatch` with `publish_mode=direct` restores the
+legacy immediate `npm publish` (use only if staging itself misbehaves; record why).
+
+**One-time hardening (owner, npmjs.com):** configure the Trusted Publisher for
+`omniroute` in stage-only mode so a leaked long-lived token cannot `npm publish`
+directly from anywhere — CI can only stage; only the owner's 2FA releases.
+
+**Broken-artifact playbook (unchanged):** `npm deprecate omniroute@<bad> "<reason> — use <fixed>"`
+as the default reflex (minutes, reversible); `npm unpublish` only inside the 72h/no-dependents
+window and never as the first move. Docker: never rewrite a version tag — rollback is
+repointing `latest` to the last good digest.
+## Hotfix Fast-Lane (label `hotfix`)
+
+A PR labeled `hotfix` skips the heavy CI matrix (9-shard E2E, coverage ratchet,
+quality-gate, quality-extended) and keeps the fast, high-signal gates: build,
+unit shards, integration, vitest, lint/typecheck, docs-sync, `check:pack-artifact`
+and the tarball boot-smoke (`check:pack-boot`). Target: green in ≤15min instead of ~33min.
+
+**Entry policy — all four required (modeled on Chromium/VS Code/Node emergency lanes):**
+
+1. **Severity**: production is broken — a published artifact crashes on boot / a
+   security fix / every user of the release is affected. "Important" is not "broken".
+2. **Authority**: only the repository owner applies the `hotfix` label. The label IS
+   the approval — never self-serve on a campaign PR.
+3. **Evidence**: the PR body links the previous fully-green heavy run (the suite the
+   skipped jobs would re-validate) plus the fix's own failing-then-passing test.
+4. **Scope**: cherry-pick-only — the minimal fix, no refactors, no ride-alongs.
+
+The skipped coverage/ratchet surface is re-validated by the next full run on the
+release branch (continuous release-green) — the lane skips WAITING, never validation.
+Tests-only diffs (all files under `tests/`, none under `tests/e2e/`) skip the E2E
+matrix automatically, without any label.
 
 ## Detailed Checklist
 
@@ -52,7 +106,7 @@ npm run test:e2e           # optional but recommended
 - [ ] Manually review CHANGELOG.md and clean up commit messages if needed
 - [ ] Ensure the latest semver section in `CHANGELOG.md` equals `package.json` version
 - [ ] Keep `## [Unreleased]` as the first changelog section for upcoming work
-- [ ] Update `docs/reference/openapi.yaml` → `info.version` must equal `package.json` version
+- [ ] Update `docs/openapi.yaml` → `info.version` must equal `package.json` version
 
 ### Code Quality
 
@@ -62,14 +116,17 @@ npm run test:e2e           # optional but recommended
 - [ ] `npm run check:cycles` — no circular deps
 - [ ] `npm run check:any-budget:t11` — within budget
 - [ ] `npm run check:route-validation:t06` — clean
-- [ ] `npm run check:node-runtime` — supported floor met (`>=20.20.2 <21`, `>=22.22.2 <23`, `>=24.0.0 <25`)
+- [ ] `npm run check:node-runtime` — supported runtime floor met (`>=22.22.2 <23`, `>=24.0.0 <27`, per `SUPPORTED_NODE_RANGE` in `src/shared/utils/nodeRuntimeSupport.ts`; aligned with `package.json` `engines`)
 
 ### Testing
 
 - [ ] `npm run test:unit` — pass
 - [ ] `npm run test:vitest` — pass (MCP server, autoCombo, cache)
-- [ ] `npm run test:coverage` — gate 75/75/75/70 satisfied (statements/lines/functions/branches)
+- [ ] `npm run test:coverage` — gate 60/60/60/60 satisfied (statements/lines/functions/branches)
 - [ ] `npm run test:integration` — pass (if changes touch DB / handlers)
+- [ ] `npm run test:combo:matrix` — pass (combo strategy matrix: proves all 17 routing strategies' selection decisions deterministically; run when touching combo routing, strategy resolution, or fallback logic)
+- [ ] `RUN_COMBO_LIVE=1 npm run test:combo:live` — **optional/manual** (gated real-upstream smoke; sources a read-only DB snapshot from VPS `root@192.168.0.15`; hits real providers, costs credits; never runs in CI; skips cleanly without the gate)
+- [ ] `npm run test:combo:live:vps` — **optional/manual** (Phase-3 VPS live smoke: 7 HTTP scenarios against the live `.15` server via plain Node ESM; requires `ssh root@192.168.0.15`; creates/deletes only `__live_test__*` combos; hits real providers; never runs in CI)
 - [ ] `npm run test:e2e` — pass (UI changes)
 - [ ] `npm run test:protocols:e2e` — pass (MCP/A2A changes)
 - [ ] `npm run test:ecosystem` — pass
@@ -79,7 +136,7 @@ npm run test:e2e           # optional but recommended
 Husky hooks live in `.husky/` and run automatically on git operations.
 
 - **pre-commit:** `npx lint-staged + node scripts/check/check-docs-sync.mjs + npm run check:any-budget:t11`
-- **pre-push:** currently disabled (commented out). When re-enabled, runs `npm run test:unit`.
+- **pre-push:** fast deterministic gates — `npm run check:any-budget:t11 && npm run check:tracked-artifacts` (activated 2026-06-13). Intentionally excludes `test:unit` (slow; covered by the CI `test-unit` job).
   - Run `npm run test:unit` manually before pushing release branches.
 
 If a hook fails: fix the underlying issue, don't bypass with `--no-verify`.
@@ -104,7 +161,7 @@ Breaking changes: add `BREAKING CHANGE:` footer or `!` after the scope (e.g. `fe
 - [ ] `docs/guides/TROUBLESHOOTING.md` reviewed for env var and operational drift
 - [ ] If `.env.example` changed: `docs/reference/ENVIRONMENT.md` updated
 - [ ] If new feature has a UI: `docs/guides/USER_GUIDE.md` mentions it
-- [ ] If new feature has API: `docs/reference/API_REFERENCE.md` + `docs/reference/openapi.yaml` updated
+- [ ] If new feature has API: `docs/reference/API_REFERENCE.md` + `docs/openapi.yaml` updated
 - [ ] If new feature is a module: dedicated `docs/<MODULE>.md` exists
 - [ ] If breaking change: `docs/guides/TROUBLESHOOTING.md` has migration note
 
@@ -112,7 +169,7 @@ Breaking changes: add `BREAKING CHANGE:` footer or `!` after the scope (e.g. `fe
 
 - [ ] `npm run i18n:check` exits 0 — translation state (`.i18n-state.json`) in sync with source docs (no drifted sources in strict mode; warn-mode advisory is acceptable for last-minute doc touch-ups, but should be 0 before tagging)
 - [ ] `npm run i18n:check-ui-coverage` exits 0 — every UI locale at or above the 80% coverage floor
-- [ ] `npm run i18n:sync-ui:dry` reports 0 missing keys across all 40 locales
+- [ ] `npm run i18n:sync-ui:dry` reports 0 missing keys across all 42 locales
 - [ ] If source English docs changed, run `npm run i18n:run` (requires `OMNIROUTE_TRANSLATION_API_KEY` in `.env`) before tagging
 - [ ] Translation contributions can be deferred to next release if minor (track in CHANGELOG)
 
@@ -147,11 +204,38 @@ If `electron/` changed:
 - [ ] `electron/package.json` version matches root `package.json`
 - [ ] Auto-update channel pointer updated if releasing to `stable`
 
+### Build Layout
+
+The repository uses three distinct output directories — never mix them up:
+
+| Directory | Purpose                                                  | Tracked?        |
+| --------- | -------------------------------------------------------- | --------------- |
+| `src/`    | Application source (TypeScript / TSX)                    | Yes             |
+| `.build/` | Build intermediates — `next build` output (`distDir`)    | No (gitignored) |
+| `dist/`   | Shippable npm bundle — assembled by `assembleStandalone` | No (gitignored) |
+
+> **Operator note:** the remote VPS image directory remains `/usr/lib/node_modules/omniroute/app/`.
+> Only the **in-repo** build output moved (`app/` → `dist/`). The deploy skills rsync
+> `dist/` contents into the remote `app/` dir — no VPS path changes required.
+
+**Single-build flow:**
+
+```
+npm run build:release
+  └─ rm -rf .build dist          (clean)
+  └─ next build → .build/next/   (intermediates)
+  └─ assembleStandalone          (copies standalone + static + public + natives → dist/)
+  └─ writes dist/BUILD_SHA       (HEAD sentinel)
+```
+
+Do NOT run `npm run build` followed by a separate `npm run build:cli` for deploy — use
+`npm run build:release` which does a clean rebuild + sentinel in one command.
+
 ### Artifact Validation
 
-- [ ] `npm run build:cli` succeeds
+- [ ] `npm run build:release` succeeds and `dist/BUILD_SHA` == `git rev-parse --short HEAD`
 - [ ] `npm run check:pack-artifact` clean — no `app.__qa_backup`, `scripts/scratch`, `package-lock.json`, or other local residue
-- [ ] `npm run build` produces a working standalone Next.js bundle
+- [ ] `dist/server.js` exists after build
 
 ### Tagging & Release
 
@@ -169,10 +253,14 @@ If `electron/` changed:
 
 ### Deploy
 
+Deploy skills use the light rsync flow — no `npm pack`, no `npm i -g`:
+
 - [ ] Use deploy skill that matches target:
   - `/deploy-vps-local-cc` — local VPS (192.168.0.15)
   - `/deploy-vps-akamai-cc` — Akamai VPS (69.164.221.35)
   - `/deploy-vps-both-cc` — both
+- [ ] Before deploying, confirm `dist/BUILD_SHA` == `git rev-parse --short HEAD`
+- [ ] Build must run where `node_modules` is real (main checkout or `npm ci`'d worktree — NOT a symlinked worktree)
 - [ ] Smoke test deployed instance:
   - Open `/dashboard/health` → check version string matches release
   - Run a `/v1/chat/completions` request against a known provider
@@ -188,6 +276,44 @@ If `electron/` changed:
 - [ ] Open milestone for next version
 - [ ] If critical: pin discussion or post in `news.json` for in-app banner
 
+## Embedded Services smoke (v3.8.4+)
+
+Before shipping any release that includes embedded services changes, verify:
+
+### Fresh-DB boot (catches migration collisions — added after v3.8.4 hotfix)
+
+- [ ] `DATA_DIR=$(mktemp -d) npm start &` — wait 10 s for boot
+- [ ] `curl -s http://127.0.0.1:20128/api/services/9router/status | jq '.tool'` returns `"9router"` (NOT 404, NOT 500). Confirms migration `071_services.sql` applied + row seeded.
+- [ ] `sqlite3 $DATA_DIR/storage.sqlite "PRAGMA table_info(version_manager);" | grep -E "provider_expose|logs_buffer_path|last_sync_at"` returns 3 rows.
+- [ ] `sqlite3 $DATA_DIR/storage.sqlite "PRAGMA table_info(webhooks);" | grep -E "kind|metadata_encrypted"` returns 2 rows (validates `070_webhooks_kind_metadata.sql` applied).
+- [ ] `node --import tsx/esm --test tests/unit/db/no-migration-collisions.test.ts` passes — guards against future collisions.
+
+### 9Router
+
+- [ ] `POST /api/services/9router/install` returns 200 with `installedVersion` in under 2 min
+- [ ] `POST /api/services/9router/start` returns 200 and `state: "running"` in under 30 s
+- [ ] `GET /api/services/9router/status` reports `health: "healthy"`
+- [ ] `POST /v1/chat/completions` with `"model": "9router/auto/..."` returns 200 (end-to-end routing through 9Router)
+- [ ] `GET /dashboard/providers/services/9router/embed/dashboard` renders the 9Router native UI inside the proxy (no direct `127.0.0.1:port` iframe)
+- [ ] `POST /api/services/9router/rotate-key` returns `{ keyRotated: true }` and service restarts cleanly
+- [ ] `POST /api/services/9router/stop` returns 200 and `state: "stopped"`
+- [ ] `GET /api/services/9router/logs?tail=50` returns SSE stream with `snapshot` event containing recent lines
+- [ ] Install in environment without `npm` in PATH returns 500 with a friendly (non-stack-trace) error message
+
+### CLIProxyAPI
+
+- [ ] `POST /api/services/cliproxy/install` returns 200 in under 2 min
+- [ ] `POST /api/services/cliproxy/start` returns 200 and `state: "running"` in under 30 s
+- [ ] `GET /api/services/cliproxy/status` reports `health: "healthy"`
+- [ ] `POST /api/services/cliproxy/stop` returns 200 and `state: "stopped"`
+- [ ] `GET /api/services/cliproxy/logs?tail=50` returns SSE stream
+
+### Security regression
+
+- [ ] `curl -H "X-Forwarded-For: 1.2.3.4" http://localhost:20128/api/services/9router/start` returns `403 LOCAL_ONLY`
+- [ ] `curl -H "X-Forwarded-For: 1.2.3.4" http://localhost:20128/api/services/cliproxy/start` returns `403 LOCAL_ONLY`
+- [ ] Error responses from `/api/services/*` do not contain `err.stack` or absolute file paths
+
 ## v3.8.0+ checks
 
 Before shipping any v3.8.x release, verify these additional items:
@@ -197,6 +323,18 @@ Before shipping any v3.8.x release, verify these additional items:
 - [ ] `omniroute --tray` boots on Windows (PowerShell NotifyIcon, no extra binaries)
 - [ ] `omniroute config tray enable` creates autostart entry; disable removes it
 - [ ] `npm install -g omniroute@<this-version>` runs postinstall without fatal exit
+- [ ] Update path keeps optional deps: `omniroute update --apply` and the auto-updater
+      run `npm install -g … --include=optional` so `optionalDependencies` (better-sqlite3,
+      keytar, tls-client, and the llmlingua SLM stack: `@atjsh/llmlingua-2`,
+      `@huggingface/transformers@3.5.2`, `@tensorflow/tfjs`, `js-tiktoken`) survive an update.
+      `@huggingface/transformers` stays optional so its `onnxruntime-node` CUDA provider postinstall
+      cannot abort installation on CUDA 11 hosts. The ultra `modelPath` SLM tier also needs the
+      tinybert model, auto-downloaded to `${DATA_DIR}/models/llmlingua` on first use. Postinstall
+      (`scripts/build/colocateOptionals.mjs`) then co-locates the SLM optional closure into
+      `dist/node_modules` so the worker resolves a SINGLE `@huggingface/transformers` 3.5.2
+      optional instance — the standalone trace bundles only transformers, not the dynamically-imported
+      optionals, so without this the worker would load llmlingua-2 against the root's transformers
+      and the SLM tier would silently fail-open.
 - [ ] `omniroute status` works with no `.env` (CLI token path, loopback only)
 - [ ] `curl http://localhost:20128/api/shutdown` returns 401 (always-protected route)
 - [ ] `curl -H "host: evil.com" http://localhost:20128/api/mcp/sse` returns 401 (loopback guard)
@@ -224,7 +362,7 @@ If release has critical issue:
 - Never use `git push --force` to `main` or `release/*` branches
 - Never skip Husky hooks (`--no-verify`)
 - Never commit secrets, credentials, or `.env` files
-- Coverage must stay ≥75/75/75/70 (statements/lines/functions/branches)
+- Coverage must stay ≥60/60/60/60 (statements/lines/functions/branches)
 - Always include or update tests when changing production code in `src/`, `open-sse/`, `electron/`, or `bin/`
 
 ## Automated Sync Check

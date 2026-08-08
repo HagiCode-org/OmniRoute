@@ -15,7 +15,8 @@ const usageHistory = await import("../../src/lib/usage/usageHistory.ts");
 const usageStats = await import("../../src/lib/usage/usageStats.ts");
 const legacyUsageAnalytics = await import("../../src/lib/usageAnalytics.ts");
 const callLogs = await import("../../src/lib/usage/callLogs.ts");
-const { calculateCost } = await import("../../src/lib/usage/costCalculator.ts");
+const { calculateCost, getCodexFastCostMultiplier } =
+  await import("../../src/lib/usage/costCalculator.ts");
 
 // Use the official clearPendingRequests export instead of manual cleanup
 const clearPendingRequests = usageHistory.clearPendingRequests;
@@ -26,6 +27,24 @@ async function resetStorage() {
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
   clearPendingRequests();
+}
+
+async function withPrepareFailure(match: string, fn: () => Promise<void>) {
+  const db = core.getDbInstance();
+  const originalPrepare = db.prepare.bind(db);
+
+  db.prepare = (sql, ...args) => {
+    if (String(sql).includes(match)) {
+      throw new Error("full history scan should not run");
+    }
+    return originalPrepare(sql, ...args);
+  };
+
+  try {
+    await fn();
+  } finally {
+    db.prepare = originalPrepare;
+  }
 }
 
 test.beforeEach(async () => {
@@ -279,6 +298,23 @@ test("getUsageStats aggregates totals, buckets, pending requests, and cost break
   assert.equal(recentBucketTotal, 1);
 });
 
+test("getUsageStats avoids loading the entire usage_history table", async () => {
+  await usageHistory.saveRequestUsage({
+    provider: "provider-a",
+    model: "model-a",
+    tokens: { input: 10, output: 5 },
+    success: true,
+    timestamp: new Date().toISOString(),
+  });
+
+  await withPrepareFailure("SELECT * FROM usage_history ORDER BY timestamp ASC", async () => {
+    const stats = await usageStats.getUsageStats();
+    assert.equal(stats.totalRequests, 1);
+    assert.equal(stats.totalPromptTokens, 10);
+    assert.equal(stats.totalCompletionTokens, 5);
+  });
+});
+
 test("getUsageStats groups renamed API key usage by stable ID", async () => {
   const db = core.getDbInstance();
   const now = new Date().toISOString();
@@ -363,11 +399,11 @@ test("computeAnalytics groups renamed API key usage by stable ID", async () => {
   assert.equal(analytics.byApiKey[0].completionTokens, 15);
 });
 
-test("Codex Fast service tier applies documented GPT-5.5 and GPT-5.4 cost multipliers", async () => {
+test("Codex Fast service tier applies GPT-5.5 and GPT-5.6 credit multipliers", async () => {
   await localDb.updatePricing({
     codex: {
       "gpt-5.5": { input: 5, output: 30 },
-      "gpt-5.4": { input: 5, output: 30 },
+      "gpt-5.6-sol": { input: 5, output: 30 },
     },
   });
 
@@ -375,8 +411,15 @@ test("Codex Fast service tier applies documented GPT-5.5 and GPT-5.4 cost multip
 
   assert.equal(await calculateCost("codex", "gpt-5.5", tokens), 0.02);
   assert.equal(await calculateCost("codex", "gpt-5.5", tokens, { serviceTier: "priority" }), 0.05);
-  assert.equal(await calculateCost("codex", "gpt-5.4-high", tokens, { serviceTier: "fast" }), 0.04);
+  assert.equal(await calculateCost("codex", "gpt-5.5", tokens, { serviceTier: "flex" }), 0.01);
+  assert.equal(
+    await calculateCost("codex", "gpt-5.6-sol-high", tokens, { serviceTier: "fast" }),
+    0.03
+  );
+  assert.equal(getCodexFastCostMultiplier("cx", "gpt-5.6-terra-ultra", "fast"), 1.5);
+  assert.equal(getCodexFastCostMultiplier("codex", "gpt-5.6-luna-max", "priority"), 1.5);
   assert.equal(await calculateCost("openai", "gpt-5.5", tokens, { serviceTier: "priority" }), 0.02);
+  assert.equal(await calculateCost("openai", "gpt-5.5", tokens, { serviceTier: "flex" }), 0.02);
 });
 
 test("recent request summaries are generated from SQLite call logs", async () => {
@@ -419,6 +462,7 @@ test("pending request metadata stores sanitized payload previews and clears afte
       token: "super-secret-token",
       messages: [{ role: "user", content: "hello" }],
     },
+    stage: "registered",
   });
 
   usageHistory.updatePendingRequest("gpt-test", "openai", "conn-preview", {
@@ -427,10 +471,12 @@ test("pending request metadata stores sanitized payload previews and clears afte
       authorization: "Bearer super-secret-token",
       messages: [{ role: "user", content: "hello" }],
     },
+    stage: "sending_to_provider",
   });
 
   const pending = usageHistory.getPendingRequests();
-  const detail = pending.details["conn-preview"]["gpt-test (openai)"];
+  const detailArr = pending.details["conn-preview"]["gpt-test (openai)"];
+  const detail = detailArr[0];
   const clientRequestPreview = detail.clientRequest as Record<string, unknown>;
   const providerRequestPreview = detail.providerRequest as Record<string, unknown>;
 
@@ -438,6 +484,8 @@ test("pending request metadata stores sanitized payload previews and clears afte
   assert.equal(clientRequestPreview.token, "[REDACTED]");
   assert.equal(providerRequestPreview.authorization, "[REDACTED]");
   assert.equal(detail.providerUrl, "https://api.example.com/v1/chat/completions");
+  assert.equal(detail.stage, "sending_to_provider");
+  assert.equal(typeof detail.stageUpdatedAt, "number");
 
   usageHistory.trackPendingRequest("gpt-test", "openai", "conn-preview", false);
   assert.equal(pending.details["conn-preview"], undefined);
@@ -473,4 +521,45 @@ test("clearPendingRequests allows fresh tracking after clearing", () => {
   const pending = usageHistory.getPendingRequests();
   assert.equal(pending.byModel["model-d (provider-w)"], 1);
   assert.ok(pending.details["conn-4"]);
+});
+
+test("getUsageSummary counts total_requests from daily_usage_summary, not 1-per-row (#usage-stats-fix)", async () => {
+  const db = core.getDbInstance();
+
+  // Insert a daily_usage_summary row with total_requests=50, 1000 input, 500 output.
+  // With the old COUNT(*) query this would count as 1 request; with SUM(requests)
+  // it must count as 50.
+  db.prepare(`
+    INSERT INTO daily_usage_summary (provider, model, date, total_requests, total_input_tokens, total_output_tokens, total_cost)
+    VALUES ('openai', 'gpt-4', '2024-01-10', 50, 1000, 500, 0.02)
+  `).run();
+
+  // Also insert one raw row so we can verify the UNION merges both legs.
+  db.prepare(`
+    INSERT INTO usage_history (timestamp, provider, model, tokens_input, tokens_output, success, latency_ms, service_tier)
+    VALUES ('2024-01-20T10:00:00.000Z', 'openai', 'gpt-4', 100, 50, 1, 200, 'standard')
+  `).run();
+
+  // Build a unified source with rawCutoffDate BETWEEN the two rows so both
+  // legs are exercised: aggregated leg gets the Jan 10 row, raw leg gets the Jan 20 row.
+  const { buildUnifiedSource } = await import("../../src/lib/db/usageAnalytics/sources.ts");
+  const { getUsageSummary } = await import("../../src/lib/db/usageAnalytics.ts");
+  const { unifiedSource, unifiedParams } = buildUnifiedSource({
+    sinceIso: "2024-01-01T00:00:00.000Z",
+    untilIso: null,
+    rawCutoffDate: "2024-01-15", // raw leg starts at Jan 15; summary leg is before Jan 15
+    apiKeyWhere: "",
+    apiKeyParams: {},
+  });
+
+  const summary = getUsageSummary(unifiedSource, unifiedParams);
+
+  // 50 from daily_usage_summary + 1 from raw usage_history = 51
+  assert.equal(summary.totalRequests, 51, "totalRequests must be 50 (aggregated) + 1 (raw), not 1+1");
+  // 1000 from daily_usage_summary + 100 from raw = 1100
+  assert.equal(summary.promptTokens, 1100, "promptTokens must merge aggregated + raw token sums");
+  // 500 from daily_usage_summary + 50 from raw = 550
+  assert.equal(summary.completionTokens, 550, "completionTokens must merge aggregated + raw token sums");
+  // All 51 requests are successful (aggregated leg hardcodes success=1, raw has success=1)
+  assert.equal(summary.successfulRequests, 51, "successfulRequests must count all rolled-up requests as successful");
 });

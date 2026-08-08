@@ -5,8 +5,12 @@
  * query the codebase via CodeGraph, and execute CLI commands for full control.
  */
 
-import { execSync } from "node:child_process";
-import { createCombo, getAllCombos, updateCombo } from "@/lib/db/combos";
+import { execFile, execSync } from "node:child_process";
+import { promisify } from "node:util";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
+
+const execFileAsync = promisify(execFile);
+import { createCombo, getCombos, updateCombo } from "@/lib/db/combos";
 import { getProviderConnections } from "@/lib/db/providers";
 import { createApiKey, revokeApiKey, getApiKeys } from "@/lib/db/apiKeys";
 import {
@@ -110,7 +114,7 @@ export const COPILOT_TOOLS: CopilotTool[] = [
     description: "List all configured combos with their strategy and target count",
     parameters: [],
     handler: async () => {
-      const combos = await getAllCombos();
+      const combos = await getCombos();
       if (!combos || combos.length === 0)
         return "No combos configured. Create one with createCombo.";
       let output = `**${combos.length} combo(s) configured**\n\n`;
@@ -381,15 +385,20 @@ export const COPILOT_TOOLS: CopilotTool[] = [
       if (!cliPath) return "omniroute CLI not found in PATH. Install OmniRoute first.";
 
       try {
-        const output = execSync(`omniroute ${cmd}`, {
+        const trimmedCmd = cmd.trim();
+        if (!trimmedCmd) return "Please provide a command to execute.";
+        const argv = (trimmedCmd.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || []).map((arg) =>
+          arg.replace(/^["']|["']$/g, "")
+        );
+        const { stdout } = await execFileAsync(cliPath, argv, {
           encoding: "utf-8",
           timeout: 30000,
           maxBuffer: 1024 * 1024,
         });
-        return `\`\`\`\n${output.trim()}\n\`\`\``;
+        return `\`\`\`\n${stdout.trim()}\n\`\`\``;
       } catch (err: unknown) {
         const e = err as { stderr?: string; stdout?: string; message?: string };
-        return `Error executing CLI command:\n${e.stderr || e.stdout || e.message || "Unknown error"}`;
+        return `Error executing CLI command:\n${sanitizeErrorMessage(e.stderr || e.stdout || e.message || "Unknown error")}`;
       }
     },
   },
