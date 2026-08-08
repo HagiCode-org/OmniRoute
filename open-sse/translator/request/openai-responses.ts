@@ -14,7 +14,6 @@ import {
 } from "../../config/providerRegistry.ts";
 import { collectResponsesTools } from "./openai-responses/additionalTools.ts";
 import { flattenNamespaceToolName } from "./openai-responses/namespaceFlatten.ts";
-import { openaiToOpenAIResponsesRequest } from "./openai-responses/toResponses.ts";
 import {
   JsonRecord,
   RESPONSES_STORE_MARKER,
@@ -29,10 +28,6 @@ import {
   shouldRequestClaudeSummarizedThinking,
   unsupportedFeature,
 } from "./openai-responses/helpers.ts";
-
-// chat -> Responses direction extracted to a pure leaf; re-exported for external
-// importers (tests). Host imports it back for registration below.
-export { openaiToOpenAIResponsesRequest } from "./openai-responses/toResponses.ts";
 
 /**
  * #8459: Convert a tool output content-part array to a safe string for Chat Completions
@@ -853,8 +848,7 @@ export function openaiToOpenAIResponsesRequest(
                 }
                 if (contentItem.type === "image_url") {
                   const imgUrl = contentItem.image_url as
-                    | string
-                    | { url?: string; detail?: string };
+                    string | { url?: string; detail?: string };
                   const imgResult: JsonRecord = {
                     type: "input_image",
                     image_url: typeof imgUrl === "string" ? imgUrl : imgUrl?.url || "",
