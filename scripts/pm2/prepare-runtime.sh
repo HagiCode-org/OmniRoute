@@ -52,7 +52,11 @@ if [[ ! -f "$ROOT_DIR/node_modules/next/package.json" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$ROOT_DIR/.next/BUILD_ID" ]]; then
+build_id_path="$ROOT_DIR/${NEXT_DIST_DIR:-.build/next}/BUILD_ID"
+
+if [[ ! -f "$build_id_path" ]]; then
   echo "[pm2] Build artifacts not found. Running npm run build..."
   bash "$ROOT_DIR/scripts/pm2/use-project-node.sh" npm run build
+else
+  echo "[pm2] Build artifacts found at $build_id_path; skipping npm run build"
 fi
