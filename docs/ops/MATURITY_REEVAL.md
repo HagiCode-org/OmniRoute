@@ -50,13 +50,13 @@ The strongest antidote against coverage-gaming was **advisory**. **Today**:
 
 - `scripts/check/check-mutation-ratchet.mjs` (advisory by default, `--ratchet` blocking, graceful skip);
 - `config/quality/quality-baseline.json` has seeded `mutationScore.<module>` entries (`direction: up`, `dedicatedGate`);
-- `.github/workflows/nightly-mutation.yml` has the **"Mutation score ratchet (blocking)"** job that unifies batch reports and ratchets merged per-module scores.
+- Manual mutation runs use the **"Mutation score ratchet (blocking)"** checks to unify batch reports and ratchet merged per-module scores.
 
 Result: the per-module mutation score **cannot regress** — coverage has ceased to be a vanity metric.
 
 ### 2.3 ✅ Quick-win gates (Phase 6A/7) delivered
 
-- **a11y axe-core "fake-green" fixed:** `@axe-core/playwright` in devDeps; `a11y.spec.ts` with conditional `REQUIRE_AXE` skip; job in `nightly-resilience.yml`.
+- **a11y axe-core "fake-green" fixed:** `@axe-core/playwright` in devDeps; `a11y.spec.ts` with conditional `REQUIRE_AXE` skip; run manually when needed.
 - **complexity scans `bin/`+`electron`:** `check-complexity.mjs` includes those directories in `ESLINT_ARGS`.
 - **tracked-artifacts in pre-commit + pre-push:** `.husky/pre-commit` + `pre-push` block accidentally tracked artifacts.
 

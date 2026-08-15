@@ -22,14 +22,13 @@ green on its first CI run.
 > never a contributor concern. No piece **closes** a PR (credit theft) nor
 > **weakens** a test to pass.
 
-## The family (4 pieces) — and how each runs independently
+## The family (3 pieces) — and how each runs independently
 
 | Piece                                                                      | What it is                                                                        | When to run                                                                       | Scope                           |
 | -------------------------------------------------------------------------- | --------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- | ------------------------------- |
 | **`/green-prs`** (Solution A)                                              | On-demand scan by the maintainer of the **queue of open PRs**                     | **Independently, periodically** — and especially **before** a `/generate-release` | Entire PR queue → `release/**`  |
 | **`/validate-release-green`** (Solution C — `npm run check:release-green`) | Validation engine: reproduces the full gate against a branch OR a merge candidate | Independently, at any time                                                        | A specific branch or a merge-PR |
 | **`/babysit <PR#>`**                                                       | Drives **live CI** of **one** PR to green                                         | Independently, per PR                                                             | A single PR                     |
-| **`nightly-release-green.yml`** (Solution D)                               | Automated nightly workflow; opens issue on HARD red                               | Automatic (cron)                                                                  | The active release branch       |
 
 **Short answer to "is this only for releases?":** **no.** `/green-prs` was designed to
 run **periodically, between releases**. Running independently is the normal use — release is just
@@ -84,8 +83,6 @@ Can **prepare** the queue without merging; only merges when explicitly requested
 
 - Run **`/green-prs` periodically** (e.g., weekly) and **always before a
   `/generate-release`**.
-- Keep **`nightly-release-green.yml`** (Solution D) as a continuous signal: when it opens a
-  HARD red issue, it is time for a scan.
 - Use **`/validate-release-green`** ad-hoc to check a branch or a specific merge candidate.
 - Use **`/babysit <PR#>`** when a specific PR needs to be driven to green on live CI.
 

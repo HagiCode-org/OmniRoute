@@ -191,16 +191,10 @@ Runs after `build`. Blocks merge on failure.
 | `test:vitest`    | MCP server (94 tools), autoCombo, cache — vitest runner | Yes                                                                        |
 | `test:vitest:ui` | UI component tests — vitest runner                      | **Advisory** (`continue-on-error: true`) — failing until Fase 6A UI triage |
 
-### Nightly workflows (scheduled, advisory)
+### Extended validation (manual)
 
-These run on a cron schedule (and `workflow_dispatch`), never on PRs. All are advisory.
-
-| Workflow               | Validates                                                                                                                                           | Blocking     |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
-| `nightly-property`     | fast-check property tests with a random seed + high run count                                                                                       | **Advisory** |
-| `nightly-resilience`   | heap-growth gate, chaos fault-injection, k6 load/soak                                                                                               | **Advisory** |
-| `nightly-llm-security` | promptfoo injection guard (block mode) + garak probes (skipped without a provider secret)                                                           | **Advisory** |
-| `nightly-schemathesis` | OpenAPI contract fuzzing (schemathesis) against a live OmniRoute using `docs/openapi.yaml` — surfaces spec violations / unhandled 500s (Fase 8 B.4) | **Advisory** |
+Extended property, resilience, security, and OpenAPI contract checks are run manually when
+needed rather than on a scheduled cadence.
 
 ---
 
@@ -272,11 +266,11 @@ decrease (−1); and "tighten via `--update` next cycle" written 31 times and ho
 once. A cap that outlives the code that earned it silently converts every completed
 decomposition into a growth allowance for whoever edits the file next.
 
-`nightly-release-green.yml` → job **`bank-ratchet-shrinks`** closes that loop:
+The maintainer can run the **`bank-ratchet-shrinks`** validation manually to close that loop:
 
 |          |                                                                                                        |
 | -------- | ------------------------------------------------------------------------------------------------------ |
-| Runs on  | `schedule` (3×/day) + `workflow_dispatch` — deliberately **not** `push`                                |
+| Runs on  | `workflow_dispatch` or a local maintainer run                                                          |
 | Measures | the highest `release/vX.Y.Z`, same resolution + injection guard as `release-green`                     |
 | Writes   | `check:file-size --update` and `check:complexity-ratchets --update` (both shrink-only by construction) |
 | Verifies | `npm run check:ratchet-bank` (`scripts/quality/verify-ratchet-bank.mjs`)                               |
