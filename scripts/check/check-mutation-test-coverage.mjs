@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 // check-mutation-test-coverage — guards against tap.testFiles drift.
 //
-// WHY: Stryker (nightly-mutation) only runs the test files listed in
+// WHY: Stryker only runs the test files listed in
 // stryker.conf.json `tap.testFiles` against each mutant. When a NEW unit test
 // that covers a mutated module is added (or an existing one is split/renamed)
 // but NOT added to tap.testFiles, that test's kills stop counting. The mutants
 // it would kill then go COVERED-but-unkilled = SURVIVED on a cold run, so the
 // module's COVERED mutation score collapses and the blocking mutationScore
-// ratchet (nightly-mutation.yml) false-fails — but only on cold-cache nights,
+// ratchet false-fails — but only on cold-cache runs,
 // because the warm incremental run reuses the older (passing) verdicts. The
 // pass/fail then tracks GitHub cache state, not code quality. Root cause:
 // tap.testFiles is a hand-maintained list with no drift guard. This is it.
@@ -67,14 +67,16 @@ export function findCoverageDrift({ mutate, tapTestFiles, unitTests }) {
 function listUnitTests() {
   // Static argv — no shell, no interpolation.
   const out = execFileSync("git", ["ls-files", "tests/unit"], { encoding: "utf8" });
-  return out
-    .split("\n")
-    .filter((f) => /\.test\.ts$/.test(f))
-    // Exclude tests/unit/build/: these test the build TOOLING (scripts/), not the
-    // mutated runtime modules. They legitimately embed module paths as fixture
-    // strings (e.g. this gate's own test), which would otherwise false-match.
-    .filter((f) => !f.startsWith("tests/unit/build/"))
-    .map((path) => ({ path, content: fs.readFileSync(path, "utf8") }));
+  return (
+    out
+      .split("\n")
+      .filter((f) => /\.test\.ts$/.test(f))
+      // Exclude tests/unit/build/: these test the build TOOLING (scripts/), not the
+      // mutated runtime modules. They legitimately embed module paths as fixture
+      // strings (e.g. this gate's own test), which would otherwise false-match.
+      .filter((f) => !f.startsWith("tests/unit/build/"))
+      .map((path) => ({ path, content: fs.readFileSync(path, "utf8") }))
+  );
 }
 
 function main() {

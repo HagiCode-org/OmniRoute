@@ -1,4 +1,4 @@
-// Regression guard for #7226: API-only smoke/nightly workflows must build with
+// Regression guard for #7226: API-only smoke workflows must build with
 // OMNIROUTE_BUILD_BACKEND_ONLY=1 so `npm run build:cli`'s fallback full build
 // (scripts/build/prepublish.ts -> build-next-isolated.mjs) skips the ~126-leaf-page
 // dashboard UI graph these workflows never exercise. Without this env var, the
@@ -52,10 +52,6 @@ interface Target {
 
 const TARGETS: Target[] = [
   { file: "dast-smoke.yml", jobName: "dast-smoke", stepName: "Build CLI bundle" },
-  { file: "nightly-schemathesis.yml", jobName: "schemathesis", stepName: "Build CLI bundle" },
-  { file: "nightly-resilience.yml", jobName: "k6-soak", stepName: "Build CLI bundle" },
-  { file: "nightly-llm-security.yml", jobName: "promptfoo-guard", stepName: "Build CLI bundle" },
-  { file: "nightly-llm-security.yml", jobName: "garak", stepName: "Build CLI bundle" },
 ];
 
 for (const { file, jobName, stepName } of TARGETS) {
@@ -78,7 +74,10 @@ test("npm-publish.yml 'Build CLI bundle (standalone app)' step must NOT be backe
   const publishJob = Object.values(doc.jobs).find((job) =>
     job.steps.some((s) => s.name === "Build CLI bundle (standalone app)")
   );
-  assert.ok(publishJob, "npm-publish.yml must have a job with a 'Build CLI bundle (standalone app)' step");
+  assert.ok(
+    publishJob,
+    "npm-publish.yml must have a job with a 'Build CLI bundle (standalone app)' step"
+  );
   const step = publishJob!.steps.find((s) => s.name === "Build CLI bundle (standalone app)")!;
   assert.equal(
     isBackendOnly(step),

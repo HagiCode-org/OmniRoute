@@ -2,11 +2,10 @@
   "$schema": "https://stryker-mutator.io/schemas/stryker-schema.json",
   "_comment": [
     "Mutation testing for the ~8 critical modules (Task 11 — Fase 7).",
-    "NIGHTLY ONLY — DO NOT run on every PR. Mutation testing is expensive:",
+    "MANUAL ONLY — DO NOT run on every PR. Mutation testing is expensive:",
     "  - Each mutant requires a full test suite execution.",
     "  - The 8 modules produce ~200–500 mutants; est. 30–90 min per run.",
-    "  - Wired to the nightly CI workflow (.github/workflows/nightly-mutation.yml),",
-    "    NOT to the 'lint' / 'quality-gate' PR jobs.",
+    "  - Run manually when mutation coverage needs to be refreshed, NOT in PR jobs.",
     "",
     "TEST RUNNER — @stryker-mutator/tap-runner (NOT vitest):",
     "  The 8 critical modules are covered by node:test files in tests/unit/",
@@ -22,7 +21,7 @@
     "  npm install --save-dev @stryker-mutator/core @stryker-mutator/tap-runner",
     "",
     "Run manually:",
-    "  npm run test:mutation                       # full run (slow — nightly budget)",
+    "  npm run test:mutation                       # full run (slow — manual only)",
     "  npx stryker run --dryRunOnly                 # validate the baseline only (no mutants)",
     "  (single-module probe: temporarily narrow `mutate` + `tap.testFiles` in this file)",
     "",
@@ -30,7 +29,7 @@
     "test files run green in the Stryker sandbox and the perTest coverage map builds for",
     "all 8 instrumented modules (15k+ mutants). The baseline dry-run takes ~20 min with",
     "concurrency=1; the full mutation phase runs on top (advisory, capped by the workflow",
-    "timeout). So the nightly produces REAL mutation scores for the 8 modules.",
+    "timeout). A manual run produces REAL mutation scores for the 8 modules.",
     "",
     "Mutation score per module → quality-baseline.json key 'mutationScore.<module>'",
     "Direction: up (score can only improve; ratchet blocks drops — wired in a later INT phase)."
@@ -39,9 +38,7 @@
   "incremental": true,
   "incrementalFile": "reports/mutation/stryker-incremental.json",
   "testRunner": "tap",
-  "plugins": [
-    "@stryker-mutator/tap-runner"
-  ],
+  "plugins": ["@stryker-mutator/tap-runner"],
   "tap": {
     "testFiles": [
       "tests/unit/7993-noauth-proxy-routing.test.ts",
@@ -416,11 +413,7 @@
     ".worktrees",
     ".stryker-tmp"
   ],
-  "reporters": [
-    "progress",
-    "html",
-    "json"
-  ],
+  "reporters": ["progress", "html", "json"],
   "htmlReporter": {
     "fileName": "reports/mutation/mutation.html"
   },
